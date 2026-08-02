@@ -2,4 +2,5 @@ flask
 pyTelegramBotAPI
 groq
 Pillow
-rembg
+rembg[cpu]
+
