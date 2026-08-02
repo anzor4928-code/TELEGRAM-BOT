@@ -1,0 +1,4 @@
+pyTelegramBotAPI
+groq
+Pillow
+rembg
