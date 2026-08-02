@@ -166,7 +166,6 @@ QUESTIONS = [
     { "text": "Самое долгоживущее млекопитающее на Земле — гренландский кит?", "truth": True }
 ]
 
-# Настройки ролей
 ROLES = {
     "psychologist": {
         "name": "🧘 Психотерапевт",
@@ -222,10 +221,8 @@ def send_welcome(message):
     markup = types.InlineKeyboardMarkup(row_width=2)
     btn_draw = types.InlineKeyboardButton("🎨 Сгенерировать арт", callback_data="ask_draw")
     btn_modes = types.InlineKeyboardButton("🎭 Выбрать ИИ-личность", callback_data="choose_mode")
-
     btn_game = types.InlineKeyboardButton("🎮 Игра: Правда или Ложь", callback_data="start_chat_game")
     btn_top = types.InlineKeyboardButton("🏆 Топ игроков", callback_data="show_leaderboard")
-
     btn_help = types.InlineKeyboardButton("📖 Справка", callback_data="help")
     btn_about = types.InlineKeyboardButton("✨ О системе", callback_data="about")
 
@@ -281,11 +278,19 @@ def command_modes(message):
 def command_start_game(message):
     user_id = message.from_user.id
     import random
+    
+    conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute("SELECT score FROM scores WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    current_score = row[0] if row else 0
+    conn.close()
+
     q_index = random.randint(0, len(QUESTIONS) - 1)
     q_data = QUESTIONS[q_index]
 
     game_sessions[user_id] = {
-        "score": game_sessions.get(user_id, {}).get("score", 0),
+        "score": current_score,
         "q_index": q_index,
         "correct_ans": q_data["truth"]
     }
@@ -295,7 +300,6 @@ def command_start_game(message):
     btn_false = types.InlineKeyboardButton("❌ Ложь", callback_data="ans_false")
     markup.add(btn_true, btn_false)
 
-    current_score = game_sessions[user_id]["score"]
     text = (
         f"🎮 <b>Игра: Правда или Ложь</b>\n"
         f"⭐ Ваши очки: <b>{current_score}</b>\n\n"
@@ -435,11 +439,19 @@ def callback_query(call):
     elif call.data == "start_chat_game":
         bot.answer_callback_query(call.id)
         import random
+        
+        conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute("SELECT score FROM scores WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        current_score = row[0] if row else 0
+        conn.close()
+
         q_index = random.randint(0, len(QUESTIONS) - 1)
         q_data = QUESTIONS[q_index]
 
         game_sessions[user_id] = {
-            "score": game_sessions.get(user_id, {}).get("score", 0),
+            "score": current_score,
             "q_index": q_index,
             "correct_ans": q_data["truth"]
         }
@@ -449,7 +461,6 @@ def callback_query(call):
         btn_false = types.InlineKeyboardButton("❌ Ложь", callback_data="ans_false")
         markup.add(btn_true, btn_false)
 
-        current_score = game_sessions[user_id]["score"]
         text = (
             f"🎮 <b>Игра: Правда или Ложь</b>\n"
             f"⭐ Ваши очки: <b>{current_score}</b>\n\n"
@@ -461,11 +472,18 @@ def callback_query(call):
         bot.answer_callback_query(call.id)
 
         if user_id not in game_sessions:
+            conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("SELECT score FROM scores WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            current_score = row[0] if row else 0
+            conn.close()
+
             import random
             q_index = random.randint(0, len(QUESTIONS) - 1)
             q_data = QUESTIONS[q_index]
             game_sessions[user_id] = {
-                "score": 0,
+                "score": current_score,
                 "q_index": q_index,
                 "correct_ans": q_data["truth"]
             }
