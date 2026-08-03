@@ -26,22 +26,12 @@ def init_db():
 
 init_db()
 
-# --- 2. Настройка Flask для 24/7 работы (чтобы Render не усыплял бота) ---
+# --- 2. Настройка Flask для 24/7 работы ---
 app = Flask("")
 
 @app.route("/")
 def home():
     return "🚀 Bot Server is active and running smoothly!"
-
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    t = threading.Thread(target=run_web)
-    t.daemon = True
-    t.start()
-
-keep_alive()
 
 # --- 3. Основная логика Telegram бота ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -600,6 +590,15 @@ def handle_message(message):
         print(f"Ошибка Groq API: {e}")
         bot.send_message(message.chat.id, "❌ Произошла ошибка при обращении к нейросети.")
 
-if __name__ == "__main__":
+# --- Запуск бота в отдельном потоке, а Flask — в главном для Render ---
+def run_bot():
     print("Бот запущен и полностью готов к работе!")
-    bot.infinity_polling()
+    bot.infinity_polling(skip_pending=True)
+
+if __name__ == "__main__":
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
