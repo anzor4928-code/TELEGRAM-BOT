@@ -828,9 +828,10 @@ def cb_game_answer(call):
   else:
     streak = 0
     current_score = max(0, current_score - 5)
+    correct_label = "Правда" if correct else "Ложь"
     res_text = (
-        f"❌ <b>Неверно!</b> Правильный вариант: <b>{'Правда' if correct else"
-        f" 'Ложь'}</b>\n\n📖 <b>Объяснение факта:</b> {q_data['explanation']}"
+        f"❌ <b>Неверно!</b> Правильный вариант: <b>{correct_label}</b>\n\n"
+        f"📖 <b>Объяснение факта:</b> {q_data['explanation']}"
     )
 
   cursor.execute(
@@ -1212,4 +1213,3 @@ if __name__ == "__main__":
 
   port = int(os.environ.get("PORT", 10000))
   app.run(host="0.0.0.0", port=port)
-
