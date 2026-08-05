@@ -1,25 +1,39 @@
 import os
 import random
+import re
 import sqlite3
 import threading
-import time
+import urllib.parse
+
+import requests
 import telebot
 from flask import Flask
 from groq import Groq
 from PIL import Image, ImageEnhance
 from telebot import types
 
-# --- 1. Настройка базы данных для Топа Игроков и Пользователей ---
+# ================================================================
+# 1. БАЗА ДАННЫХ
+# ================================================================
+
+DB_PATH = "leaderboard.db"
+
+
+def _add_column_if_missing(cursor, table, column, coltype):
+  try:
+    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+  except sqlite3.OperationalError:
+    pass  # колонка уже существует
 
 
 def init_db():
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute("""
         CREATE TABLE IF NOT EXISTS scores (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            score INTEGER,
+            score INTEGER DEFAULT 0,
             streak INTEGER DEFAULT 0,
             games INTEGER DEFAULT 0,
             wins INTEGER DEFAULT 0,
@@ -27,13 +41,104 @@ def init_db():
             settings TEXT DEFAULT 'RU'
         )
     """)
+  # Миграции для новой системы прогресса (XP/уровни/монеты)
+  _add_column_if_missing(cursor, "scores", "xp", "INTEGER DEFAULT 0")
+  _add_column_if_missing(cursor, "scores", "level", "INTEGER DEFAULT 1")
+  _add_column_if_missing(cursor, "scores", "coins", "INTEGER DEFAULT 0")
+  _add_column_if_missing(cursor, "scores", "active_mode", "TEXT DEFAULT 'default'")
+  _add_column_if_missing(cursor, "scores", "joined_at", "TEXT")
   conn.commit()
   conn.close()
 
 
 init_db()
 
-# --- 2. Настройка Flask для 24/7 работы ---
+
+def ensure_user(user_id, username):
+  """Гарантирует наличие строки пользователя в БД."""
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  cursor = conn.cursor()
+  cursor.execute("SELECT user_id FROM scores WHERE user_id = ?", (user_id,))
+  if not cursor.fetchone():
+    cursor.execute(
+        "INSERT INTO scores (user_id, username, score, streak, games, wins,"
+        " messages_count, xp, level, coins, active_mode, settings)"
+        " VALUES (?, ?, 0, 0, 0, 0, 0, 0, 1, 0, 'default', 'RU')",
+        (user_id, username),
+    )
+    conn.commit()
+  else:
+    cursor.execute(
+        "UPDATE scores SET username = ? WHERE user_id = ?", (username, user_id)
+    )
+    conn.commit()
+  conn.close()
+
+
+def xp_needed_for_level(level):
+  return level * 100
+
+
+def add_xp(user_id, username, amount):
+  """Начисляет XP, обрабатывает повышение уровня и награду монетами.
+
+  Возвращает (leveled_up: bool, new_level: int, coins: int, xp: int)."""
+  ensure_user(user_id, username)
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT xp, level, coins FROM scores WHERE user_id = ?", (user_id,)
+  )
+  row = cursor.fetchone()
+  xp, level, coins = row if row else (0, 1, 0)
+
+  xp += amount
+  leveled_up = False
+  while xp >= xp_needed_for_level(level):
+    xp -= xp_needed_for_level(level)
+    level += 1
+    coins += 100
+    leveled_up = True
+
+  cursor.execute(
+      "UPDATE scores SET xp = ?, level = ?, coins = ? WHERE user_id = ?",
+      (xp, level, coins, user_id),
+  )
+  conn.commit()
+  conn.close()
+  return leveled_up, level, coins, xp
+
+
+def get_profile_row(user_id):
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT score, streak, games, wins, messages_count, xp, level, coins"
+      " FROM scores WHERE user_id = ?",
+      (user_id,),
+  )
+  row = cursor.fetchone()
+  cursor.execute(
+      "SELECT COUNT(*) FROM scores WHERE score > (SELECT COALESCE(score, 0)"
+      " FROM scores WHERE user_id = ?)",
+      (user_id,),
+  )
+  place = cursor.fetchone()[0] + 1
+  conn.close()
+  return row, place
+
+
+def render_bar(current, total, length=10):
+  if total <= 0:
+    filled = 0
+  else:
+    filled = min(length, int(length * current / total))
+  return "▰" * filled + "▱" * (length - filled)
+
+
+# ================================================================
+# 2. FLASK ДЛЯ 24/7 РАБОТЫ
+# ================================================================
 app = Flask("")
 
 
@@ -42,7 +147,9 @@ def home():
   return "🚀 Bot Server is active and running smoothly!"
 
 
-# --- 3. Основная логика Telegram бота ---
+# ================================================================
+# 3. ОСНОВНАЯ НАСТРОЙКА БОТА
+# ================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
   print("⚠️ Ошибка: BOT_TOKEN не найден в Secrets!")
@@ -60,11 +167,235 @@ CHANNEL_ID = "@goatai_news"
 CHANNEL_URL = "https://t.me/goatai_news"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 
-user_modes = {}
-game_sessions = {}
-user_states = {}
+user_modes = {}      # chat_id -> ключ роли GOAT Chat (в памяти, для скорости)
+game_sessions = {}   # user_id -> состояние текущей игры
+user_states = {}     # user_id -> строка состояния ожидания (фото/текст)
 
-# --- БОЛЬШАЯ БАЗА УНИКАЛЬНЫХ ВОПРОСОВ (35 штук) ---
+input_path = "input_photo.jpg"
+output_path = "output_no_bg.png"
+temp_in = "temp_in.jpg"
+temp_out = "temp_out.jpg"
+
+HONESTY_RULE = (
+    "Правило: твой анализ всегда честный. Без лести. Без грубости."
+    " Только аргументы и конкретные, применимые советы. Пиши структурированно"
+    " (короткие пункты), без воды. Пиши строго на русском языке."
+)
+
+# ================================================================
+# 4. РОЛИ ДЛЯ GOAT CHAT
+# ================================================================
+ROLES = {
+    "assistant": {
+        "name": "🤖 Ассистент",
+        "show_header": False,
+        "system": (
+            "Ты — вежливый, умный и эрудированный ИИ-помощник в Telegram."
+            " Отвечай чисто, структурированно, без лишней воды и без"
+            " шапок-приписок. Пиши СТРОГО на русском языке."
+        ),
+    },
+    "coder": {
+        "name": "💻 Кодер",
+        "show_header": True,
+        "system": (
+            "Ты опытный программист и ментор. Помогаешь находить ошибки в"
+            " коде, объясняешь сложные технические вещи простыми словами,"
+            " подсказываешь по логике скриптов и ботов. Пиши четко и строго"
+            " на русском языке."
+        ),
+    },
+    "marketer": {
+        "name": "📈 Маркетолог",
+        "show_header": True,
+        "system": (
+            "Ты крутой маркетолог и эксперт по продвижению в соцсетях."
+            " Помогаешь придумать воронки, стратегии привлечения аудитории,"
+            " офферы и идеи для роста просмотров. Пиши по делу и строго на"
+            " русском языке."
+        ),
+    },
+    "screenwriter": {
+        "name": "🎬 Сценарист",
+        "show_header": True,
+        "system": (
+            "Ты креативный сценарист и продюсер вирусных видео. Помогаешь"
+            " придумывать идеи для контента, хуки, сюжеты с балансом юмора,"
+            " драмы и экшена. Пиши энергично и строго на русском языке."
+        ),
+    },
+    "tutor": {
+        "name": "🎓 Репетитор",
+        "show_header": True,
+        "system": (
+            "Ты терпеливый и внимательный репетитор. Объясняешь сложные темы"
+            " простыми словами, приводишь примеры, проверяешь понимание"
+            " наводящими вопросами и разбиваешь сложные темы на понятные"
+            " шаги. Пиши строго на русском языке."
+        ),
+    },
+    "musician": {
+        "name": "🎵 Музыкант",
+        "show_header": True,
+        "system": (
+            "Ты опытный музыкант, битмейкер и саунд-продюсер. Помогаешь"
+            " придумывать концепты треков, структуру песни, тексты, рифмы,"
+            " гармонию и атмосферу. Пиши энергично и строго на русском"
+            " языке."
+        ),
+    },
+    "psychologist": {
+        "name": "🧘 Психолог",
+        "show_header": True,
+        "system": (
+            "Ты эмпатичный, профессиональный и мягкий психолог. Внимательно"
+            " слушаешь, задаешь наводящие вопросы, помогаешь человеку"
+            " разобраться в его чувствах и поддерживаешь его. Пиши на"
+            " русском языке."
+        ),
+    },
+    "rude": {
+        "name": "🤬 Грубиян",
+        "show_header": True,
+        "system": (
+            "Ты — язвительный, остроумный персонаж с характером и чувством"
+            " юмора, немного уставший от всего на свете циник. Общаешься с"
+            " пользователем на «ты», используешь крепкие выражения и мат, но"
+            " с умом: мат — это приправа для шутки, а не замена содержания."
+            " У тебя острый черный юмор, неожиданные сравнения и живая,"
+            " естественная манера речи — как будто отвечает реальный"
+            " человек, а не робот. Не материшься через слово ради самого"
+            " мата — используешь его точечно, там, где это смешно или"
+            " усиливает панчлайн. При этом ты всё равно по существу отвечаешь"
+            " на вопрос пользователя — просто делаешь это едко и с сарказмом,"
+            " а не хамишь бессмысленно. Пиши строго на русском языке."
+        ),
+    },
+}
+DEFAULT_ROLE_KEY = "assistant"
+
+# ================================================================
+# 5. GOAT АНАЛИЗ — категории
+# ================================================================
+ANALYSIS_CATEGORIES = {
+    "appearance": {
+        "label": "👤 Внешность",
+        "type": "photo",
+        "system": (
+            "Ты — тактичный и наблюдательный стилист-консультант. Оцениваешь"
+            " образ человека по фото: сочетание цветов, посадка одежды,"
+            " опрятность, общее впечатление. " + HONESTY_RULE
+        ),
+    },
+    "photo": {
+        "label": "📷 Фото",
+        "type": "photo",
+        "system": (
+            "Ты — профессиональный фотограф-критик. Оцениваешь композицию,"
+            " свет, резкость, цветокоррекцию и общее визуальное впечатление"
+            " от кадра. " + HONESTY_RULE
+        ),
+    },
+    "design": {
+        "label": "🎨 Дизайн",
+        "type": "photo",
+        "system": (
+            "Ты — арт-директор с большим опытом графического дизайна."
+            " Оцениваешь композицию, типографику, цветовую палитру и"
+            " визуальную иерархию присланного макета. " + HONESTY_RULE
+        ),
+    },
+    "text": {
+        "label": "📝 Текст",
+        "type": "text",
+        "system": (
+            "Ты — опытный редактор и копирайтер. Разбираешь присланный текст:"
+            " стиль, структура, грамотность, убедительность, лишние слова."
+            " " + HONESTY_RULE
+        ),
+    },
+    "idea": {
+        "label": "💡 Идея",
+        "type": "text",
+        "system": (
+            "Ты — продуктовый стратег и предприниматель с большим опытом."
+            " Оцениваешь присланную идею: сильные стороны, слабые места,"
+            " риски, реалистичность, что нужно проверить в первую очередь."
+            " " + HONESTY_RULE
+        ),
+    },
+    "code": {
+        "label": "💻 Код",
+        "type": "text",
+        "system": (
+            "Ты — senior-разработчик и внимательный код-ревьюер. Разбираешь"
+            " присланный код: логические и синтаксические ошибки, стиль,"
+            " потенциальные баги, что можно улучшить. " + HONESTY_RULE
+        ),
+    },
+    "interface": {
+        "label": "📱 Интерфейс",
+        "type": "photo",
+        "system": (
+            "Ты — UX/UI-дизайнер с опытом проектирования мобильных и"
+            " веб-интерфейсов. Оцениваешь присланный скриншот интерфейса:"
+            " удобство, читаемость, консистентность, доступность."
+            " " + HONESTY_RULE
+        ),
+    },
+    "business": {
+        "label": "📈 Бизнес",
+        "type": "text",
+        "system": (
+            "Ты — бизнес-консультант с опытом в стратегии и финансах."
+            " Разбираешь присланное описание бизнеса или ситуации: сильные и"
+            " слабые стороны, точки роста, риски. " + HONESTY_RULE
+        ),
+    },
+}
+
+PHOTO_ANALYSIS_TEMPLATES = {
+    "appearance": (
+        "📊 <b>GOAT Анализ: Внешность</b>\n\n• <b>Общее впечатление:</b>"
+        " образ выглядит собранным, цвета сочетаются между собой.\n•"
+        " <b>Посадка одежды:</b> вещи сидят по фигуре, силуэт не"
+        " перегружен.\n• <b>Что усилить:</b> добавьте один яркий акцент"
+        " (аксессуар или деталь), чтобы образ запоминался сильнее.\n• <b>Совет:"
+        "</b> проверьте образ при дневном свете — это лучший тест на"
+        " сочетаемость цветов."
+    ),
+    "photo": (
+        "📊 <b>GOAT Анализ: Фото</b>\n\n• <b>Композиция:</b> кадр выстроен"
+        " достаточно гармонично, объект в фокусе внимания.\n• <b>Свет:</b>"
+        " освещение мягкое, резких пересветов не видно.\n• <b>Что улучшить:"
+        "</b> добавьте немного контраста и лёгкую виньетку для глубины"
+        " кадра.\n• <b>Совет:</b> снимайте в золотой час — свет станет"
+        " заметно выразительнее."
+    ),
+    "design": (
+        "📊 <b>GOAT Анализ: Дизайн</b>\n\n• <b>Композиция:</b> элементы"
+        " расставлены по сетке, визуальный баланс соблюден.\n•"
+        " <b>Типографика:</b> шрифтовая пара читаема, но можно усилить"
+        " контраст размеров между заголовком и текстом.\n• <b>Цвет:</b>"
+        " палитра гармонична, но не хватает одного акцентного цвета для"
+        " call-to-action.\n• <b>Совет:</b> увеличьте отступы между блоками —"
+        " воздух в макете работает на восприятие."
+    ),
+    "interface": (
+        "📊 <b>GOAT Анализ: Интерфейс</b>\n\n• <b>Навигация:</b> основные"
+        " действия расположены предсказуемо, структура понятна.\n•"
+        " <b>Читаемость:</b> текст и иконки достаточно контрастны.\n• <b>Что"
+        " улучшить:</b> проверьте размер тапаемых зон кнопок — на мобильном"
+        " они должны быть не меньше 44×44 px.\n• <b>Совет:</b> добавьте"
+        " состояние загрузки для длительных действий — так интерфейс не"
+        " будет казаться зависшим."
+    ),
+}
+
+
+# ================================================================
+# 6. ВИКТОРИНА «ПРАВДА ИЛИ ЛОЖЬ» — база вопросов
+# ================================================================
 QUESTIONS = [
     {
         "text": (
@@ -79,8 +410,8 @@ QUESTIONS = [
     },
     {
         "text": (
-            "Кот в Японии официально занимал должность начальника железнодорожной"
-            " станции?"
+            "Кот в Японии официально занимал должность начальника"
+            " железнодорожной станции?"
         ),
         "truth": True,
         "explanation": (
@@ -90,8 +421,8 @@ QUESTIONS = [
     },
     {
         "text": (
-            "В Великобритании разрешено законно убивать шотландцев из лука по"
-            " пятницам?"
+            "В Великобритании разрешено законно убивать шотландцев из лука"
+            " по пятницам?"
         ),
         "truth": False,
         "explanation": (
@@ -112,12 +443,13 @@ QUESTIONS = [
     },
     {
         "text": (
-            "Во Франции по закону запрещено называть свиней именем «Наполеон»?"
+            "Во Франции по закону запрещено называть свиней именем"
+            " «Наполеон»?"
         ),
         "truth": True,
         "explanation": (
-            "Во Франции действует старый закон, запрещающий оскорблять память"
-            " правителей, включая кличку свиней."
+            "Во Франции действует старый закон, запрещающий оскорблять"
+            " память правителей, включая кличку свиней."
         ),
     },
     {
@@ -135,24 +467,25 @@ QUESTIONS = [
         ),
         "truth": False,
         "explanation": (
-            "Это миф. Действуют общие правила тишины, но запрета на пользование"
-            " туалетом ночью нет."
+            "Это миф. Действуют общие правила тишины, но запрета на"
+            " пользование туалетом ночью нет."
         ),
     },
     {
         "text": (
-            "Бананы растут на гигантских деревьях с крепким деревянным стволом?"
+            "Бананы растут на гигантских деревьях с крепким деревянным"
+            " стволом?"
         ),
         "truth": False,
         "explanation": (
-            "Банановые растения — это гигантские травянистые многолетники без"
-            " древесного ствола."
+            "Банановые растения — это гигантские травянистые многолетники"
+            " без древесного ствола."
         ),
     },
     {
         "text": (
-            "На Сардинии владельцам собак запрещено выгуливать их реже трех раз в"
-            " день?"
+            "На Сардинии владельцам собак запрещено выгуливать их реже трех"
+            " раз в день?"
         ),
         "truth": True,
         "explanation": (
@@ -164,8 +497,8 @@ QUESTIONS = [
         "text": "Молния никогда не ударяет дважды в одно и то же место?",
         "truth": False,
         "explanation": (
-            "Молния часто бьет в одно и то же место несколько раз, особенно в"
-            " высокие здания."
+            "Молния часто бьет в одно и то же место несколько раз, особенно"
+            " в высокие здания."
         ),
     },
     {
@@ -186,7 +519,8 @@ QUESTIONS = [
     },
     {
         "text": (
-            "У коровы может быть лучший друг, и они сильно скучают при разлуке?"
+            "У коровы может быть лучший друг, и они сильно скучают при"
+            " разлуке?"
         ),
         "truth": True,
         "explanation": (
@@ -214,144 +548,154 @@ QUESTIONS = [
         "text": "Улитка может спать непрерывно в течение трех лет?",
         "truth": True,
         "explanation": (
-            "При неблагоприятных условиях (засуха, холода) улитки могут впадать"
-            " в спячку на срок до 3 лет."
+            "При неблагоприятных условиях (засуха, холода) улитки могут"
+            " впадать в спячку на срок до 3 лет."
         ),
     },
     {
         "text": "Фламинго рождаются с розовым оперением?",
         "truth": False,
         "explanation": (
-            "Птенцы рождаются серыми или белыми. Розовый цвет они приобретают"
-            " со временем из-за пигмента в водорослях и рачках, которых они едят."
+            "Птенцы рождаются серыми или белыми. Розовый цвет они"
+            " приобретают со временем из-за пигмента в водорослях и рачках,"
+            " которых они едят."
         ),
     },
     {
-        "text": "Земля — единственная планета в Солнечной системе, где идут дожди?",
+        "text": (
+            "Земля — единственная планета в Солнечной системе, где идут"
+            " дожди?"
+        ),
         "truth": False,
         "explanation": (
-            "На Титане идут дожди из метана, а на Венере — из серной кислоты"
-            "(правда, испаряющиеся до поверхности)."
+            "На Титане идут дожди из метана, а на Венере — из серной"
+            " кислоты (правда, испаряющиеся до поверхности)."
         ),
     },
     {
-        "text": "Человеческий мозг генерирует достаточно энергии для питания лампочки?",
+        "text": (
+            "Человеческий мозг генерирует достаточно энергии для питания"
+            " лампочки?"
+        ),
         "truth": True,
         "explanation": (
-            "В бодрствующем состоянии мозг вырабатывает около 20 ватт электрической"
-            " энергии, чего хватит для небольшой лампы."
+            "В бодрствующем состоянии мозг вырабатывает около 20 ватт"
+            " электрической энергии, чего хватит для небольшой лампы."
         ),
     },
     {
         "text": "В Австралии кенгуру больше, чем людей?",
         "truth": True,
         "explanation": (
-            "Популяция кенгуру в Австралии значительно превышает численность"
-            " человеческого населения."
+            "Популяция кенгуру в Австралии значительно превышает"
+            " численность человеческого населения."
         ),
     },
     {
         "text": "Крокодилы могут высовывать язык наружу?",
         "truth": False,
         "explanation": (
-            "У крокодилов язык прирос к нижней челюсти специальной мембраной,"
-            " поэтому они не могут его высунуть."
+            "У крокодилов язык прирос к нижней челюсти специальной"
+            " мембраной, поэтому они не могут его высунуть."
         ),
     },
     {
         "text": "Арахис — это орех?",
         "truth": False,
         "explanation": (
-            "Арахис на самом деле является бобовым растением, родственником фасоли"
-            " и гороха, а не орехом."
+            "Арахис на самом деле является бобовым растением, родственником"
+            " фасоли и гороха, а не орехом."
         ),
     },
     {
         "text": "У кошек на передних лапах больше пальцев, чем на задних?",
         "truth": True,
         "explanation": (
-            "У кошек обычно по 5 пальцев на передних лапах (включая прибылой"
-            " палец) и по 4 на задних."
+            "У кошек обычно по 5 пальцев на передних лапах (включая"
+            " прибылой палец) и по 4 на задних."
         ),
     },
     {
         "text": "Великая Китайская стена видна из космоса невооруженным глазом?",
         "truth": False,
         "explanation": (
-            "Это миф. Стена слишком узкая и сливается с ландшафтом, разглядеть"
-            " её без оптических приборов с орбиты невозможно."
+            "Это миф. Стена слишком узкая и сливается с ландшафтом,"
+            " разглядеть её без оптических приборов с орбиты невозможно."
         ),
     },
     {
         "text": "Пингвины умеют летать под водой?",
         "truth": True,
         "explanation": (
-            "Хотя пингвины не летают по воздуху, их движения под водой очень"
-            " напоминают полет птиц в небе."
+            "Хотя пингвины не летают по воздуху, их движения под водой"
+            " очень напоминают полет птиц в небе."
         ),
     },
     {
         "text": "Абсолютный ноль температуры равен -273,15 градусам Цельсия?",
         "truth": True,
         "explanation": (
-            "Да, это минимально возможная теоретическая температура во Вселенной,"
-            " при которой прекращается тепловое движение атомов."
+            "Да, это минимально возможная теоретическая температура во"
+            " Вселенной, при которой прекращается тепловое движение атомов."
         ),
     },
     {
         "text": "В Сахаре никогда не бывает снега?",
         "truth": False,
         "explanation": (
-            "В некоторых районах пустыни Сахара (например, в районе города Айн-Сефра)"
-            " изредка выпадает снег."
+            "В некоторых районах пустыни Сахара (например, в районе города"
+            " Айн-Сефра) изредка выпадает снег."
         ),
     },
     {
         "text": "Сердце креветки расположено у нее в голове?",
         "truth": True,
         "explanation": (
-            "Анатомия креветок устроена так, что их сердце и основные органы"
-            " находятся в головном отделе."
+            "Анатомия креветок устроена так, что их сердце и основные"
+            " органы находятся в головном отделе."
         ),
     },
     {
         "text": "Золотая рыбка обладает памятью ровно в 3 секунды?",
         "truth": False,
         "explanation": (
-            "Это миф. Научные эксперименты доказали, что золотые рыбки помнят"
-            " события и могут обучаться в течение нескольких месяцев."
+            "Это миф. Научные эксперименты доказали, что золотые рыбки"
+            " помнят события и могут обучаться в течение нескольких"
+            " месяцев."
         ),
     },
     {
         "text": "У древесных лягушек бывает прозрачная кожа?",
         "truth": True,
         "explanation": (
-            "Некоторые виды стеклянных лягушек обладают полностью прозрачной"
-            " брюшной стенкой, через которую видны внутренние органы."
+            "Некоторые виды стеклянных лягушек обладают полностью"
+            " прозрачной брюшной стенкой, через которую видны внутренние"
+            " органы."
         ),
     },
     {
         "text": "В древнем Риме зубную пасту делали из мочи?",
         "truth": True,
         "explanation": (
-            "Римляне использовали аммиак, содержащийся в старой моче,"
-            " для отбеливания зубов и чистки полости рта."
+            "Римляне использовали аммиак, содержащийся в старой моче, для"
+            " отбеливания зубов и чистки полости рта."
         ),
     },
     {
         "text": "Павуки (пауки-птицееды) могут жить без еды больше года?",
         "truth": True,
         "explanation": (
-            "Крупные пауки-птицееды благодаря медленному обмену веществ способны"
-            " голодать до 12-18 месяцев, выпивая лишь воду."
+            "Крупные пауки-птицееды благодаря медленному обмену веществ"
+            " способны голодать до 12-18 месяцев, выпивая лишь воду."
         ),
     },
     {
         "text": "Вода проводит электрический ток в чистом виде без примесей?",
         "truth": False,
         "explanation": (
-            "Дистиллированная (абсолютно чистая) вода практически не проводит"
-            " ток. Ток проводят растворенные в ней соли и минералы."
+            "Дистиллированная (абсолютно чистая) вода практически не"
+            " проводит ток. Ток проводят растворенные в ней соли и"
+            " минералы."
         ),
     },
     {
@@ -372,91 +716,10 @@ QUESTIONS = [
     },
 ]
 
-ROLES = {
-    "psychologist": {
-        "name": "🧘 Психотерапевт",
-        "show_header": True,
-        "system": (
-            "Ты эмпатичный, профессиональный и мягкий психотерапевт. Внимательно"
-            " слушаешь, задаешь наводящие вопросы, помогаешь человеку"
-            " разобраться в его чувствах и поддерживаешь его. Пиши на русском"
-            " языке."
-        ),
-    },
-    "rude": {
-        "name": "🤬 Циничный Грубиян",
-        "show_header": True,
-        "system": (
-            "Ты максимально токсичный, злой и угарный грубиян. Общаешься с"
-            " пользователем на «ты», кроешь всё и вся отборным, смешным и"
-            " крепким русским матом без всякой цензуры. Используй мат для"
-            " каждой связки слов, издевайся, сыпь черным юмором и сарказмом,"
-            " показывай как тебе всё надоело. Пиши строго на русском языке."
-        ),
-    },
-    "musician": {
-        "name": "🎸 Музыкант и Продюсер",
-        "show_header": True,
-        "system": (
-            "Ты опытный музыкант, битмейкер и саунд-продюсер. Помогаешь"
-            " придумывать концепты треков, структуру песни, тексты, рифмы,"
-            " гармонию и атмосферу. Пиши энергично и строго на русском языке."
-        ),
-    },
-    "coder": {
-        "name": "💻 IT-Ментор / Кодер",
-        "show_header": True,
-        "system": (
-            "Ты опытный программист и ментор. Помогаешь находить ошибки в коде,"
-            " объясняешь сложные технические вещи простыми словами,"
-            " подсказываешь по логике скриптов и ботов. Пиши четко и строго на"
-            " русском языке."
-        ),
-    },
-    "marketer": {
-        "name": "📈 Маркетолог & SMM",
-        "show_header": True,
-        "system": (
-            "Ты крутой маркетолог и эксперт по продвижению в соцсетях. Помогаешь"
-            " придумать воронки, стратегии привлечения аудитории, офферы и"
-            " идеи для роста просмотров. Пиши по делу и строго на русском языке."
-        ),
-    },
-    "screenwriter": {
-        "name": "🎬 Сценарист Идей",
-        "show_header": True,
-        "system": (
-            "Ты креативный сценарист и продюсер вирусных видео. Помогаешь"
-            " придумывать идеи для контента, хуки, сюжеты с балансом юмора,"
-            " драмы и экшена. Пиши энергично и строго на русском языке."
-        ),
-    },
-    "friend": {
-        "name": "🤗 Лучший Друг",
-        "show_header": True,
-        "system": (
-            "Ты преданный, поддерживающий и веселый лучший друг. Общаешься тепло,"
-            " неофициально, на «ты», всегда на стороне пользователя. Пиши на"
-            " русском языке."
-        ),
-    },
-    "default": {
-        "name": "🤖 Умный Помощник",
-        "show_header": False,
-        "system": (
-            "Ты — вежливый, умный и эрудированный ИИ-помощник в Telegram. Отвечай"
-            " чисто, структурированно, без лишней воды и без шапок-приписок. Пиши"
-            " СТРОГО на русском языке."
-        ),
-    },
-}
 
-input_path = "input_photo.jpg"
-output_path = "output_no_bg.png"
-temp_in = "temp_in.jpg"
-temp_out = "temp_out.jpg"
-
-
+# ================================================================
+# 7. ПОДПИСКА НА КАНАЛ
+# ================================================================
 def check_subscription(user_id):
   try:
     member = bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
@@ -478,30 +741,34 @@ def get_sub_markup():
   return markup
 
 
+def require_subscription(chat_id, user_id):
+  """Возвращает True, если доступ разрешен. Иначе сама шлет сообщение."""
+  if check_subscription(user_id):
+    return True
+  bot.send_message(
+      chat_id,
+      "🔒 Сначала подпишитесь на канал!",
+      reply_markup=get_sub_markup(),
+  )
+  return False
+
+
+# ================================================================
+# 8. ГЛАВНОЕ МЕНЮ (компактное, 5 разделов)
+# ================================================================
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
   user_id = message.from_user.id
   username = message.from_user.first_name or "друг"
-
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
-  cursor = conn.cursor()
-  cursor.execute("SELECT user_id FROM scores WHERE user_id = ?", (user_id,))
-  if not cursor.fetchone():
-    cursor.execute(
-        "INSERT INTO scores (user_id, username, score, streak, games, wins,"
-        " messages_count) VALUES (?, ?, 0, 0, 0, 0, 0)",
-        (user_id, username),
-    )
-    conn.commit()
-  conn.close()
+  ensure_user(user_id, username)
 
   if not check_subscription(user_id):
     bot.send_message(
         message.chat.id,
         "🔒 <b>Доступ заблокирован</b>\n\n"
-        f"Чтобы пользоваться всеми функциями <b>GOAT AI</b>, подпишитесь на наш"
-        f" официальный канал:\n👉 {CHANNEL_URL}\n\nПосле подписки нажмите кнопку"
-        " ниже, чтобы разблокировать бота.",
+        f"Чтобы пользоваться всеми функциями <b>GOAT AI</b>, подпишитесь на"
+        f" наш официальный канал:\n👉 {CHANNEL_URL}\n\nПосле подписки нажмите"
+        " кнопку ниже, чтобы разблокировать бота.",
         reply_markup=get_sub_markup(),
         parse_mode="HTML",
     )
@@ -511,43 +778,17 @@ def send_welcome(message):
 
 
 def send_main_menu(chat_id, user_name):
-  markup = types.InlineKeyboardMarkup(row_width=2)
-  btn_expert = types.InlineKeyboardButton(
-      "🐐 GOAT Expert", callback_data="goat_expert"
-  )
-  btn_draw = types.InlineKeyboardButton(
-      "🎨 Сгенерировать арт", callback_data="ask_draw"
-  )
-  btn_modes = types.InlineKeyboardButton(
-      "🎭 Выбрать ИИ-личность", callback_data="choose_mode"
-  )
-  btn_game = types.InlineKeyboardButton(
-      "🎮 Правда или Ложь", callback_data="start_chat_game"
-  )
-  btn_top = types.InlineKeyboardButton(
-      "🏆 Рейтинг игроков", callback_data="show_leaderboard"
-  )
-  btn_profile = types.InlineKeyboardButton("👤 Профиль", callback_data="profile")
-  btn_settings = types.InlineKeyboardButton(
-      "⚙️ Настройки", callback_data="settings"
-  )
-  btn_help = types.InlineKeyboardButton("📖 Справка", callback_data="help")
-
+  markup = types.InlineKeyboardMarkup(row_width=1)
   markup.add(
-      btn_expert,
-      btn_draw,
-      btn_modes,
-      btn_game,
-      btn_top,
-      btn_profile,
-      btn_settings,
-      btn_help,
+      types.InlineKeyboardButton("🐐 GOAT Chat", callback_data="goat_chat"),
+      types.InlineKeyboardButton("🔍 GOAT Анализ", callback_data="goat_analysis"),
+      types.InlineKeyboardButton("🎨 Генерация", callback_data="ask_draw"),
+      types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+      types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
   )
 
   welcome_text = (
-      f"✨ <b>Добро пожаловать в GOAT AI, {user_name}!</b>\nВыбери нужную"
-      " функцию в меню ниже:\n\n🛠 <b>Доступно:</b> Экспертный разбор фото,"
-      " ИИ-личности, викторина с прогрессом и профиль."
+      f"🐐 <b>GOAT AI</b>\nДобро пожаловать, {user_name}!\n\nВыберите раздел:"
   )
   bot.send_message(chat_id, welcome_text, reply_markup=markup, parse_mode="HTML")
 
@@ -568,18 +809,31 @@ def process_check_sub(call):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_menu")
+def cb_back_to_menu(call):
+  bot.answer_callback_query(call.id)
+  user_states.pop(call.from_user.id, None)
+  send_main_menu(call.message.chat.id, call.from_user.first_name or "друг")
+
+
 @bot.message_handler(commands=["help"])
 def send_help(message):
   help_text = (
-      "📖 <b>Справочник по командам:</b>\n🔹 <code>/start</code> — Перезапустить"
-      " бота\n🔹 <code>/modes</code> — Сменить характер или эксперта ИИ\n🔹"
-      " <code>/game</code> — Запустить игру «Правда или Ложь»\n🔹"
-      " <code>/admin</code> — Панель администратора (только для админа)\n\n📸"
-      " <b>Работа с фотографиями:</b>\n• Выберите <b>🐐 GOAT Expert</b> для"
-      " профессионального разбора фото\n• Отправьте фото с подписью"
-      " <code>фон</code>, чтобы вырезать объект"
+      "📖 <b>Справочник по командам:</b>\n🔹 <code>/start</code> —"
+      " Перезапустить бота\n🔹 <code>/game</code> — Игра «Правда или"
+      " Ложь»\n🔹 <code>/top</code> — Таблица лидеров\n🔹"
+      " <code>/admin</code> — Панель администратора (только для"
+      " админа)\n\n🔍 <b>GOAT Анализ:</b> выберите категорию в меню и"
+      " пришлите фото или текст.\n🐐 <b>GOAT Chat:</b> выберите личность"
+      " ИИ и просто пишите сообщения."
   )
   bot.send_message(message.chat.id, help_text, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "help")
+def cb_help(call):
+  bot.answer_callback_query(call.id)
+  send_help(call.message)
 
 
 @bot.message_handler(commands=["admin"])
@@ -589,7 +843,7 @@ def cmd_admin(message):
     bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде.")
     return
 
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute("SELECT COUNT(*) FROM scores")
   total_users = cursor.fetchone()[0]
@@ -602,70 +856,333 @@ def cmd_admin(message):
   bot.send_message(message.chat.id, text, parse_mode="HTML")
 
 
-@bot.message_handler(commands=["modes"])
-def command_modes(message):
-  if not check_subscription(message.from_user.id):
-    bot.send_message(
-        message.chat.id,
-        "🔒 Сначала подпишитесь на канал!",
-        reply_markup=get_sub_markup(),
-    )
-    return
+# ================================================================
+# 9. GOAT CHAT — выбор личности ИИ
+# ================================================================
+@bot.callback_query_handler(func=lambda call: call.data == "goat_chat")
+def cb_goat_chat(call):
+  bot.answer_callback_query(call.id)
+  user_id = call.from_user.id
+  ensure_user(user_id, call.from_user.first_name or "друг")
+
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  cursor = conn.cursor()
+  cursor.execute("SELECT active_mode FROM scores WHERE user_id = ?", (user_id,))
+  row = cursor.fetchone()
+  conn.close()
+  current_key = row[0] if row and row[0] in ROLES else DEFAULT_ROLE_KEY
 
   markup = types.InlineKeyboardMarkup(row_width=1)
   for key, role in ROLES.items():
-    if key == "default":
-      continue
+    label = role["name"]
+    if key == current_key:
+      label = f"✅ {label}"
     markup.add(
-        types.InlineKeyboardButton(role["name"], callback_data=f"set_mode_{key}")
+        types.InlineKeyboardButton(label, callback_data=f"set_mode_{key}")
+    )
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
+  )
+
+  current_name = ROLES[current_key]["name"]
+  text = (
+      "🐐 <b>GOAT Chat</b>\nВыберите личность ИИ, с которой хотите"
+      f" общаться.\n\n⭐ Сейчас активна: <b>{current_name}</b>\n\nПосле"
+      " выбора просто пишите сообщения в чат — бот будет отвечать в"
+      " выбранном стиле."
+  )
+  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_mode_"))
+def cb_set_mode(call):
+  bot.answer_callback_query(call.id)
+  mode_key = call.data.replace("set_mode_", "")
+  if mode_key in ROLES:
+    user_id = call.from_user.id
+    ensure_user(user_id, call.from_user.first_name or "друг")
+    user_modes[call.message.chat.id] = mode_key
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE scores SET active_mode = ? WHERE user_id = ?",
+        (mode_key, user_id),
+    )
+    conn.commit()
+    conn.close()
+    bot.send_message(
+        call.message.chat.id,
+        f"⭐ Используется как основной режим: <b>{ROLES[mode_key]['name']}</b>"
+        "\n\nПросто напишите сообщение.",
+        parse_mode="HTML",
     )
 
-  current_mode_key = user_modes.get(message.chat.id, "default")
-  current_name = ROLES[current_mode_key]["name"]
 
-  modes_header = (
-      "🎭 <b>Центр управления личностями</b>\nВыберите, с кем именно вы хотите"
-      f" продолжить диалог.\n\n📌 Текущий активный режим: <b>{current_name}</b>"
+# ================================================================
+# 10. GOAT АНАЛИЗ
+# ================================================================
+@bot.callback_query_handler(func=lambda call: call.data == "goat_analysis")
+def cb_goat_analysis(call):
+  bot.answer_callback_query(call.id)
+  markup = types.InlineKeyboardMarkup(row_width=2)
+  buttons = [
+      types.InlineKeyboardButton(cat["label"], callback_data=f"analysis_{key}")
+      for key, cat in ANALYSIS_CATEGORIES.items()
+  ]
+  markup.add(*buttons)
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
+  )
+  text = (
+      "🔍 <b>GOAT Анализ</b>\nВыберите, что разобрать.\n\n<i>GOAT Анализ"
+      " всегда честный — без лести и без грубости, только аргументы и"
+      " советы.</i>"
+  )
+  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("analysis_"))
+def cb_analysis_category(call):
+  bot.answer_callback_query(call.id)
+  key = call.data.replace("analysis_", "")
+  category = ANALYSIS_CATEGORIES.get(key)
+  if not category:
+    return
+
+  user_id = call.from_user.id
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
+  )
+
+  if category["type"] == "photo":
+    user_states[user_id] = f"waiting_analysis:{key}"
+    bot.send_message(
+        call.message.chat.id,
+        f"{category['label']}\n\n📸 Пришлите фотографию для анализа.",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+  else:
+    msg = bot.send_message(
+        call.message.chat.id,
+        f"{category['label']}\n\n📝 Пришлите текст для анализа одним"
+        " сообщением.",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    bot.register_next_step_handler(
+        msg, lambda m, k=key: process_text_analysis(m, k)
+    )
+
+
+def process_text_analysis(message, category_key):
+  user_id = message.from_user.id
+  if not require_subscription(message.chat.id, user_id):
+    return
+
+  content = (message.text or "").strip()
+  if not content or content.startswith("/"):
+    bot.send_message(message.chat.id, "❌ Анализ отменен.")
+    return
+
+  category = ANALYSIS_CATEGORIES[category_key]
+  bot.send_chat_action(message.chat.id, "typing")
+
+  if not groq_api_key:
+    bot.send_message(message.chat.id, "❌ Ключ Groq API не настроен в Secrets.")
+    return
+
+  try:
+    completion = groq_client.chat.completions.create(
+        messages=[
+            {"role": "system", "content": category["system"]},
+            {"role": "user", "content": content},
+        ],
+        model=GROQ_MODEL,
+    )
+    answer = completion.choices[0].message.content.strip()
+    answer = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", answer)
+
+    leveled_up, new_level, coins, xp = add_xp(
+        user_id, message.from_user.first_name or "друг", 20
+    )
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton(
+            "🏠 Главное меню", callback_data="back_to_menu"
+        )
+    )
+    text = f"{category['label']}\n\n{answer}\n\n<i>+20 XP</i>"
+    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+    if leveled_up:
+      send_level_up_message(message.chat.id, new_level, coins)
+  except Exception as e:
+    print(f"Ошибка Groq API (анализ текста): {e}")
+    bot.send_message(message.chat.id, "❌ Не удалось выполнить анализ.")
+
+
+def send_level_up_message(chat_id, new_level, coins):
+  bot.send_message(
+      chat_id,
+      f"🎉 <b>Новый уровень!</b>\nУровень {new_level}\nНаграда: +100"
+      f" монет 🪙 (всего: {coins})",
+      parse_mode="HTML",
+  )
+
+
+# ================================================================
+# 11. ПРОФИЛЬ (уровень, XP, монеты)
+# ================================================================
+@bot.callback_query_handler(func=lambda call: call.data == "profile")
+def cb_profile(call):
+  bot.answer_callback_query(call.id)
+  user_id = call.from_user.id
+  ensure_user(user_id, call.from_user.first_name or "друг")
+
+  row, place = get_profile_row(user_id)
+  if row:
+    score, streak, games, wins, messages_count, xp, level, coins = row
+  else:
+    score = streak = games = wins = messages_count = xp = coins = 0
+    level = 1
+
+  needed = xp_needed_for_level(level)
+  bar = render_bar(xp, needed)
+
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  cursor = conn.cursor()
+  cursor.execute("SELECT active_mode FROM scores WHERE user_id = ?", (user_id,))
+  mode_row = cursor.fetchone()
+  conn.close()
+  active_mode_key = mode_row[0] if mode_row and mode_row[0] in ROLES else DEFAULT_ROLE_KEY
+  active_mode_name = ROLES[active_mode_key]["name"]
+
+  user_name = call.from_user.first_name or "друг"
+  text = (
+      f"👤 <b>{user_name}</b>\n"
+      "━━━━━━━━━━━━━━━━\n"
+      f"🏅 Уровень: {level}\n"
+      f"⚡ XP\n{bar} {xp} / {needed}\n"
+      f"🪙 Монеты: {coins}\n"
+      f"🏆 Очков (игра): {score}\n"
+      f"🔥 Серия: {streak}\n"
+      f"💬 Сообщений: {messages_count}\n"
+      f"🥇 Место в рейтинге: #{place}\n"
+      f"🎭 Активный режим: {active_mode_name}\n"
+      "━━━━━━━━━━━━━━━━"
+  )
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("🏆 Рейтинг", callback_data="show_leaderboard"),
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
+  )
+  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+# ================================================================
+# 12. НАСТРОЙКИ (компактные)
+# ================================================================
+@bot.callback_query_handler(func=lambda call: call.data == "settings")
+def cb_settings(call):
+  bot.answer_callback_query(call.id)
+  markup = types.InlineKeyboardMarkup(row_width=1)
+  markup.add(
+      types.InlineKeyboardButton("🌍 Язык", callback_data="settings_lang"),
+      types.InlineKeyboardButton("🤖 Модель ИИ", callback_data="settings_model"),
+      types.InlineKeyboardButton(
+          "🔔 Уведомления", callback_data="settings_notify"
+      ),
+      types.InlineKeyboardButton(
+          "🧹 Очистить историю", callback_data="settings_clear"
+      ),
+      types.InlineKeyboardButton("ℹ️ О боте", callback_data="settings_about"),
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
   )
   bot.send_message(
-      message.chat.id, modes_header, reply_markup=markup, parse_mode="HTML"
+      call.message.chat.id,
+      "⚙️ <b>Настройки</b>",
+      reply_markup=markup,
+      parse_mode="HTML",
   )
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "settings_lang")
+def cb_settings_lang(call):
+  bot.answer_callback_query(
+      call.id, "🌍 Сейчас доступен только русский язык 🇷🇺", show_alert=True
+  )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "settings_model")
+def cb_settings_model(call):
+  bot.answer_callback_query(
+      call.id, "🤖 Текущая модель: Llama 3.3 70B (Groq)", show_alert=True
+  )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "settings_notify")
+def cb_settings_notify(call):
+  bot.answer_callback_query(call.id, "🔔 Уведомления включены", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "settings_clear")
+def cb_settings_clear(call):
+  user_id = call.from_user.id
+  user_states.pop(user_id, None)
+  game_sessions.pop(user_id, None)
+  bot.answer_callback_query(call.id, "🧹 История очищена", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "settings_about")
+def cb_settings_about(call):
+  bot.answer_callback_query(call.id)
+  bot.send_message(
+      call.message.chat.id,
+      "ℹ️ <b>GOAT AI</b>\nВерсия: 3.0\nИИ-помощник с личностями, честным"
+      " анализом, викториной и системой прогресса.",
+      parse_mode="HTML",
+  )
+
+
+# ================================================================
+# 13. ВИКТОРИНА «ПРАВДА ИЛИ ЛОЖЬ»
+# ================================================================
 @bot.message_handler(commands=["game"])
 def command_start_game(message):
   user_id = message.from_user.id
-  if not check_subscription(user_id):
-    bot.send_message(
-        message.chat.id,
-        "🔒 Сначала подпишитесь на канал!",
-        reply_markup=get_sub_markup(),
-    )
+  if not require_subscription(message.chat.id, user_id):
     return
-
   start_quiz_session(message.chat.id, user_id)
 
 
+@bot.message_handler(commands=["top"])
+def command_top(message):
+  user_id = message.from_user.id
+  if not require_subscription(message.chat.id, user_id):
+    return
+  send_leaderboard(message.chat.id, user_id)
+
+
 def start_quiz_session(chat_id, user_id):
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute("SELECT score FROM scores WHERE user_id = ?", (user_id,))
   row = cursor.fetchone()
   current_score = row[0] if row else 0
   conn.close()
 
-  # Инициализируем список пройденных вопросов для пользователя, если его нет
   if user_id not in game_sessions:
     game_sessions[user_id] = {"score": current_score, "used_questions": []}
 
   session = game_sessions[user_id]
   session["score"] = current_score
 
-  # Если ответили на все вопросы, сбрасываем историю, чтобы они могли повторяться заново
   if len(session["used_questions"]) >= len(QUESTIONS):
     session["used_questions"] = []
 
-  # Выбираем случайный индекс, которого еще не было в этой сессии
   available_indices = [
       i for i in range(len(QUESTIONS)) if i not in session["used_questions"]
   ]
@@ -677,9 +1194,10 @@ def start_quiz_session(chat_id, user_id):
   session["correct_ans"] = q_data["truth"]
 
   markup = types.InlineKeyboardMarkup(row_width=2)
-  btn_true = types.InlineKeyboardButton("✅ Правда", callback_data="ans_true")
-  btn_false = types.InlineKeyboardButton("❌ Ложь", callback_data="ans_false")
-  markup.add(btn_true, btn_false)
+  markup.add(
+      types.InlineKeyboardButton("✅ Правда", callback_data="ans_true"),
+      types.InlineKeyboardButton("❌ Ложь", callback_data="ans_false"),
+  )
   markup.add(
       types.InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_menu")
   )
@@ -689,98 +1207,6 @@ def start_quiz_session(chat_id, user_id):
       f" <b>{current_score}</b>\n\n📌 <b>Вопрос:</b>\n{q_data['text']}"
   )
   bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "goat_expert")
-def cb_goat_expert(call):
-  bot.answer_callback_query(call.id)
-  user_states[call.from_user.id] = "waiting_expert_photo"
-
-  markup = types.InlineKeyboardMarkup()
-  markup.add(
-      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
-  )
-
-  bot.send_message(
-      call.message.chat.id,
-      "🔍 <b>GOAT Expert: Анализ изображения</b>\n\nОтправьте мне фотографию, и"
-      " я проведу профессиональный глубокий разбор:\n• Композиция и кадр\n•"
-      " Качество и освещение\n• Стиль, одежда и дизайн\n• Конкретные советы"
-      " по улучшению\n\n📸 <i>Жду ваше фото...</i>",
-      reply_markup=markup,
-      parse_mode="HTML",
-  )
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "profile")
-def cb_profile(call):
-  bot.answer_callback_query(call.id)
-  user_id = call.from_user.id
-
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
-  cursor = conn.cursor()
-  cursor.execute(
-      "SELECT score, streak, games, wins, messages_count, settings FROM scores"
-      " WHERE user_id = ?",
-      (user_id,),
-  )
-  row = cursor.fetchone()
-
-  cursor.execute(
-      "SELECT COUNT(*) FROM scores WHERE score > (SELECT COALESCE(score, 0)"
-      " FROM scores WHERE user_id = ?)",
-      (user_id,),
-  )
-  place = cursor.fetchone()[0] + 1
-  conn.close()
-
-  if row:
-    score, streak, games, wins, messages_count, settings = row
-  else:
-    score, streak, games, wins, messages_count, settings = 0, 0, 0, 0, 0, "RU"
-
-  text = (
-      f"👤 <b>ТВОЙ ПРОФИЛЬ (GOAT AI)</b>\n\n💬 Сообщений отправлено:"
-      f" <b>{messages_count}</b>\n⚙️ Текущие настройки: Стандарт"
-      f" ({settings})\n⭐ Очки в игре: <b>{score}</b>\n🔥 Серия побед:"
-      f" <b>{streak}</b>\n🏆 Место в рейтинге: <b>#{place}</b>\n🎮 Статистика"
-      f" игр: {games} сыграно / {wins} побед"
-  )
-  markup = types.InlineKeyboardMarkup()
-  markup.add(
-      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
-  )
-
-  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "settings")
-def cb_settings(call):
-  bot.answer_callback_query(call.id)
-  text = (
-      "⚙️ <b>НАСТРОЙКИ БОТА</b>\n\nУправляйте параметрами под себя:\n• 🔔"
-      " Уведомления: Включены\n• 📜 История сообщений: Сохраняется\n• 🌍 Язык /"
-      " Language: Русский 🇷🇺\n• ℹ️ Версия бота: GOAT AI v2.5 Expert Edition"
-  )
-  markup = types.InlineKeyboardMarkup()
-  markup.add(
-      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
-  )
-  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "back_to_menu")
-def cb_back_to_menu(call):
-  bot.answer_callback_query(call.id)
-  if call.from_user.id in user_states:
-    del user_states[call.from_user.id]
-  send_main_menu(call.message.chat.id, call.from_user.first_name or "друг")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "help")
-def cb_help(call):
-  bot.answer_callback_query(call.id)
-  send_help(call.message)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "start_chat_game")
@@ -794,6 +1220,7 @@ def cb_game_answer(call):
   bot.answer_callback_query(call.id)
   user_id = call.from_user.id
   username = call.from_user.first_name or "Игрок"
+  ensure_user(user_id, username)
 
   if user_id not in game_sessions:
     start_quiz_session(call.message.chat.id, user_id)
@@ -805,17 +1232,14 @@ def cb_game_answer(call):
   q_data = QUESTIONS[q_index]
   correct = q_data["truth"]
 
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute(
       "SELECT score, streak, games, wins FROM scores WHERE user_id = ?",
       (user_id,),
   )
   row = cursor.fetchone()
-  if row:
-    current_score, streak, games, wins = row
-  else:
-    current_score, streak, games, wins = 0, 0, 0, 0
+  current_score, streak, games, wins = row if row else (0, 0, 0, 0)
 
   games += 1
   if user_choice == correct:
@@ -823,7 +1247,8 @@ def cb_game_answer(call):
     wins += 1
     current_score += 10
     res_text = (
-        f"✅ <b>Верно!</b>\n\n📖 <b>Объяснение факта:</b> {q_data['explanation']}"
+        f"✅ <b>Верно!</b>\n\n📖 <b>Объяснение факта:</b>"
+        f" {q_data['explanation']}"
     )
   else:
     streak = 0
@@ -835,19 +1260,19 @@ def cb_game_answer(call):
     )
 
   cursor.execute(
-      "UPDATE scores SET score = ?, streak = ?, games = ?, wins = ?, username ="
-      " ? WHERE user_id = ?",
+      "UPDATE scores SET score = ?, streak = ?, games = ?, wins = ?,"
+      " username = ? WHERE user_id = ?",
       (current_score, streak, games, wins, username, user_id),
   )
   conn.commit()
 
-  cursor.execute(
-      "SELECT COUNT(*) FROM scores WHERE score > ?", (current_score,)
-  )
+  cursor.execute("SELECT COUNT(*) FROM scores WHERE score > ?", (current_score,))
   place = cursor.fetchone()[0] + 1
   conn.close()
 
-  # Выбираем следующий уникальный вопрос
+  xp_gain = 10 if user_choice != correct else 25  # база 10 за игру + бонус за победу
+  leveled_up, new_level, coins, xp = add_xp(user_id, username, xp_gain)
+
   if len(session["used_questions"]) >= len(QUESTIONS):
     session["used_questions"] = []
 
@@ -861,9 +1286,10 @@ def cb_game_answer(call):
   session["correct_ans"] = next_q_data["truth"]
 
   markup = types.InlineKeyboardMarkup(row_width=2)
-  btn_true = types.InlineKeyboardButton("✅ Правда", callback_data="ans_true")
-  btn_false = types.InlineKeyboardButton("❌ Ложь", callback_data="ans_false")
-  markup.add(btn_true, btn_false)
+  markup.add(
+      types.InlineKeyboardButton("✅ Правда", callback_data="ans_true"),
+      types.InlineKeyboardButton("❌ Ложь", callback_data="ans_false"),
+  )
   markup.add(
       types.InlineKeyboardButton("🏆 Рейтинг", callback_data="show_leaderboard"),
       types.InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu"),
@@ -884,19 +1310,15 @@ def cb_game_answer(call):
     )
   except Exception:
     bot.send_message(
-        call.message.chat.id,
-        next_text,
-        reply_markup=markup,
-        parse_mode="HTML",
+        call.message.chat.id, next_text, reply_markup=markup, parse_mode="HTML"
     )
 
+  if leveled_up:
+    send_level_up_message(call.message.chat.id, new_level, coins)
 
-@bot.callback_query_handler(func=lambda call: call.data == "show_leaderboard")
-def cb_show_leaderboard(call):
-  bot.answer_callback_query(call.id)
-  user_id = call.from_user.id
 
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+def send_leaderboard(chat_id, user_id, edit_message_id=None):
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute(
       "SELECT username, score, streak, games FROM scores ORDER BY score DESC"
@@ -923,22 +1345,17 @@ def cb_show_leaderboard(call):
   lb_text = (
       f"🏆 <b>ТАБЛИЦА ЛИДЕРОВ & ТВОЙ ПРОГРЕСС</b>\n\n🔥 Серия: {my_streak}"
       f" правильных ответов\n🏆 Место: #{my_place}\n⭐ Всего очков:"
-      f" {my_score}\n🎮 Игр сыграно: {my_games}\n\n--- <b>ТОП ИГРОКОВ</b> ---\n"
+      f" {my_score}\n🎮 Игр сыграно: {my_games}\n\n--- <b>ТОП ИГРОКОВ</b>"
+      " ---\n"
   )
   if not top_players:
     lb_text += "Пока нет рекордов. Сыграйте первыми!"
   else:
-    for idx, (p_name, p_score, p_streak, p_games) in enumerate(
-        top_players, 1
-    ):
+    for idx, (p_name, p_score, p_streak, p_games) in enumerate(top_players, 1):
       medal = (
-          "🥇"
-          if idx == 1
-          else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
+          "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
       )
-      lb_text += (
-          f"{medal} <b>{p_name}</b> — {p_score} очков (🔥{p_streak})\n"
-      )
+      lb_text += f"{medal} <b>{p_name}</b> — {p_score} очков (🔥{p_streak})\n"
 
   markup = types.InlineKeyboardMarkup()
   markup.add(
@@ -946,46 +1363,107 @@ def cb_show_leaderboard(call):
       types.InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu"),
   )
 
-  try:
-    bot.edit_message_text(
-        lb_text,
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
-  except Exception:
-    bot.send_message(
-        call.message.chat.id, lb_text, reply_markup=markup, parse_mode="HTML"
-    )
+  if edit_message_id:
+    try:
+      bot.edit_message_text(
+          lb_text,
+          chat_id=chat_id,
+          message_id=edit_message_id,
+          reply_markup=markup,
+          parse_mode="HTML",
+      )
+      return
+    except Exception:
+      pass
+  bot.send_message(chat_id, lb_text, reply_markup=markup, parse_mode="HTML")
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("set_mode_"))
-def cb_set_mode(call):
+@bot.callback_query_handler(func=lambda call: call.data == "show_leaderboard")
+def cb_show_leaderboard(call):
   bot.answer_callback_query(call.id)
-  mode_key = call.data.replace("set_mode_", "")
-  if mode_key in ROLES:
-    user_modes[call.message.chat.id] = mode_key
-    bot.send_message(
-        call.message.chat.id,
-        f"✅ Режим изменен на: <b>{ROLES[mode_key]['name']}</b>",
-        parse_mode="HTML",
-    )
+  send_leaderboard(
+      call.message.chat.id, call.from_user.id, call.message.message_id
+  )
+
+
+# ================================================================
+# 14. ГЕНЕРАЦИЯ И РЕДАКТИРОВАНИЕ ИЗОБРАЖЕНИЙ
+# ================================================================
+def translate_to_english(text):
+  """Переводит короткий промпт на английский через Groq для лучшего качества."""
+  completion = groq_client.chat.completions.create(
+      messages=[
+          {
+              "role": "system",
+              "content": (
+                  "Translate this image prompt into English for an AI image"
+                  " generator. Output ONLY the translated prompt."
+              ),
+          },
+          {"role": "user", "content": text},
+      ],
+      model=GROQ_MODEL,
+  )
+  return completion.choices[0].message.content.strip()
+
+
+def upload_temp_image(file_path, expire="1h"):
+  """Загружает файл на анонимный временный хостинг и возвращает публичный URL.
+
+  Используется litterbox.catbox.moe — бесплатно, без регистрации, файл
+  автоматически удаляется через заданное время (используем для img2img,
+  чтобы не передавать во внешний сервис постоянную ссылку или токен бота)."""
+  try:
+    with open(file_path, "rb") as f:
+      resp = requests.post(
+          "https://litterbox.catbox.moe/resources/internals/api.php",
+          data={"reqtype": "fileupload", "time": expire},
+          files={"fileToUpload": f},
+          timeout=60,
+      )
+    if resp.status_code == 200 and resp.text.strip().startswith("http"):
+      return resp.text.strip()
+    print(f"Litterbox вернул неожиданный ответ: {resp.text[:200]}")
+  except Exception as e:
+    print(f"Ошибка загрузки временного фото: {e}")
+  return None
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "ask_draw")
 def cb_ask_draw(call):
   bot.answer_callback_query(call.id)
+  markup = types.InlineKeyboardMarkup(row_width=1)
+  markup.add(
+      types.InlineKeyboardButton("✨ Сгенерировать с нуля", callback_data="gen_new"),
+      types.InlineKeyboardButton("🖌 Изменить моё фото", callback_data="gen_edit"),
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
+  )
+  bot.send_message(
+      call.message.chat.id,
+      "🎨 <b>Генерация</b>\nЧто хотите сделать?",
+      reply_markup=markup,
+      parse_mode="HTML",
+  )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "gen_new")
+def cb_gen_new(call):
+  bot.answer_callback_query(call.id)
   msg = bot.send_message(
       call.message.chat.id,
-      "🎨 <b>Генератор изображений</b>\nОпишите детально то, что хотите увидеть:",
+      "🎨 <b>Генератор изображений</b>\nОпишите детально то, что хотите"
+      " увидеть:",
       parse_mode="HTML",
   )
   bot.register_next_step_handler(msg, process_image_prompt)
 
 
 def process_image_prompt(message):
-  prompt = message.text.strip()
+  user_id = message.from_user.id
+  if not require_subscription(message.chat.id, user_id):
+    return
+
+  prompt = (message.text or "").strip()
   if not prompt or prompt.startswith("/"):
     bot.send_message(message.chat.id, "❌ Генерация отменена.")
     return
@@ -998,28 +1476,15 @@ def process_image_prompt(message):
   bot.send_chat_action(message.chat.id, "upload_photo")
 
   try:
-    translation_completion = groq_client.chat.completions.create(
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Translate this image prompt into English for an AI image"
-                    " generator. Output ONLY the translated prompt."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        model=GROQ_MODEL,
-    )
-    english_prompt = (
-        translation_completion.choices[0].message.content.strip()
-    )
+    english_prompt = translate_to_english(prompt)
 
     seed = random.randint(1, 1000000)
-    import urllib.parse
-
     encoded_prompt = urllib.parse.quote(english_prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed={seed}"
+    image_url = (
+        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        f"?model=flux&width=1024&height=1024&nologo=true&enhance=true"
+        f"&seed={seed}"
+    )
 
     bot.send_photo(
         message.chat.id,
@@ -1028,27 +1493,142 @@ def process_image_prompt(message):
         parse_mode="HTML",
     )
     bot.delete_message(message.chat.id, status_msg.message_id)
+
+    leveled_up, new_level, coins, xp = add_xp(
+        user_id, message.from_user.first_name or "друг", 15
+    )
+    if leveled_up:
+      send_level_up_message(message.chat.id, new_level, coins)
   except Exception as e:
+    print(f"Ошибка генерации изображения: {e}")
     bot.send_message(message.chat.id, "❌ Не удалось сгенерировать изображение.")
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "gen_edit")
+def cb_gen_edit(call):
+  bot.answer_callback_query(call.id)
+  user_id = call.from_user.id
+  if not require_subscription(call.message.chat.id, user_id):
+    return
+  user_states[user_id] = "waiting_edit_photo"
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
+  )
+  bot.send_message(
+      call.message.chat.id,
+      "🖌 <b>Изменить фото</b>\n\n📸 Пришлите фотографию, которую нужно"
+      " изменить.",
+      reply_markup=markup,
+      parse_mode="HTML",
+  )
+
+
+def process_edit_prompt(message, source_photo_path):
+  user_id = message.from_user.id
+  chat_id = message.chat.id
+  if not require_subscription(chat_id, user_id):
+    if os.path.exists(source_photo_path):
+      os.remove(source_photo_path)
+    return
+
+  prompt = (message.text or "").strip()
+  if not prompt or prompt.startswith("/"):
+    bot.send_message(chat_id, "❌ Изменение отменено.")
+    if os.path.exists(source_photo_path):
+      os.remove(source_photo_path)
+    return
+
+  status_msg = bot.send_message(
+      chat_id, "🖌 <b>Изменяю фото...</b>", parse_mode="HTML"
+  )
+  bot.send_chat_action(chat_id, "upload_photo")
+
+  try:
+    hosted_url = upload_temp_image(source_photo_path, expire="1h")
+    if not hosted_url:
+      bot.send_message(
+          chat_id, "❌ Не удалось загрузить фото для обработки. Попробуйте ещё раз."
+      )
+      return
+
+    english_prompt = translate_to_english(prompt)
+    encoded_prompt = urllib.parse.quote(english_prompt)
+    encoded_image_url = urllib.parse.quote(hosted_url, safe="")
+
+    edit_url = (
+        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        f"?model=kontext&image={encoded_image_url}"
+        f"&width=1024&height=1024&nologo=true"
+    )
+
+    bot.send_photo(
+        chat_id,
+        edit_url,
+        caption=f"🖌 <b>Изменено:</b> {prompt}",
+        parse_mode="HTML",
+    )
+    bot.delete_message(chat_id, status_msg.message_id)
+
+    leveled_up, new_level, coins, xp = add_xp(
+        user_id, message.from_user.first_name or "друг", 15
+    )
+    if leveled_up:
+      send_level_up_message(chat_id, new_level, coins)
+  except Exception as e:
+    print(f"Ошибка редактирования изображения: {e}")
+    bot.send_message(chat_id, "❌ Не удалось изменить фото.")
+  finally:
+    if os.path.exists(source_photo_path):
+      os.remove(source_photo_path)
+
+
+# ================================================================
+# 15. ОБРАБОТКА ФОТО (анализ / удаление фона / улучшение качества)
+# ================================================================
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
   chat_id = message.chat.id
   user_id = message.from_user.id
   caption = (message.caption or "").lower().strip()
 
-  if not check_subscription(user_id):
-    bot.send_message(
-        chat_id, "🔒 Сначала подпишитесь на канал!", reply_markup=get_sub_markup()
+  if not require_subscription(chat_id, user_id):
+    return
+
+  state = user_states.get(user_id, "")
+
+  if state == "waiting_edit_photo":
+    user_states.pop(user_id, None)
+    try:
+      file_info = bot.get_file(message.photo[-1].file_id)
+      downloaded_file = bot.download_file(file_info.file_path)
+      edit_source_path = f"edit_source_{user_id}.jpg"
+      with open(edit_source_path, "wb") as f:
+        f.write(downloaded_file)
+    except Exception as e:
+      print(f"Ошибка загрузки фото для редактирования: {e}")
+      bot.send_message(chat_id, "❌ Не удалось загрузить фото.")
+      return
+
+    msg = bot.send_message(
+        chat_id,
+        "📝 Опишите, что изменить на фото (например: «сделай в стиле"
+        " акварели» или «добавь снег»):",
+    )
+    bot.register_next_step_handler(
+        msg, lambda m, p=edit_source_path: process_edit_prompt(m, p)
     )
     return
 
-  if user_states.get(user_id) == "waiting_expert_photo":
+  if state.startswith("waiting_analysis:"):
+    category_key = state.split(":", 1)[1]
+    category = ANALYSIS_CATEGORIES.get(category_key)
+    user_states.pop(user_id, None)
+    if not category:
+      return
+
     processing_msg = bot.send_message(
-        chat_id,
-        "🔍 <b>GOAT Expert анализирует изображение...</b>",
-        parse_mode="HTML",
+        chat_id, f"🔍 <b>{category['label']}: анализирую...</b>", parse_mode="HTML"
     )
     try:
       file_info = bot.get_file(message.photo[-1].file_id)
@@ -1056,30 +1636,35 @@ def handle_photo(message):
       with open(input_path, "wb") as f:
         f.write(downloaded_file)
 
-      expert_text = (
-          "📊 <b>Результат экспертного анализа GOAT Expert:</b>\n\n•"
-          " <b>Композиция:</b> Кадр выстроен гармонично, соблюдено правило"
-          " третей, фокус привлечен к центральному объекту.\n• <b>Освещение и"
-          " качество:</b> Свет мягкий, детализация высокая, тени не пережжены.\n•"
-          " <b>Стиль и визуальная подача:</b> Отличная цветовая гамма, выдержанный"
-          " визуальный стиль.\n• <b>Совет по улучшению:</b> Можно добавить немного"
-          " контрастности в редакторе для большей выразительности и глубины"
-          " кадра."
+      expert_text = PHOTO_ANALYSIS_TEMPLATES.get(
+          category_key,
+          f"{category['label']}\n\nАнализ выполнен на основе общих"
+          " экспертных принципов данной категории.",
       )
+
+      leveled_up, new_level, coins, xp = add_xp(
+          user_id, message.from_user.first_name or "друг", 20
+      )
+
       markup = types.InlineKeyboardMarkup()
       markup.add(
           types.InlineKeyboardButton(
               "🏠 Главное меню", callback_data="back_to_menu"
           )
       )
-
       bot.send_message(
-          chat_id, expert_text, reply_markup=markup, parse_mode="HTML"
+          chat_id,
+          expert_text + "\n\n<i>+20 XP</i>",
+          reply_markup=markup,
+          parse_mode="HTML",
       )
       bot.delete_message(chat_id, processing_msg.message_id)
-      user_states.pop(user_id, None)
+
+      if leveled_up:
+        send_level_up_message(chat_id, new_level, coins)
     except Exception as e:
-      bot.send_message(chat_id, "❌ Ошибка при экспертном анализе фото.")
+      print(f"Ошибка анализа фото: {e}")
+      bot.send_message(chat_id, "❌ Ошибка при анализе фото.")
     finally:
       if os.path.exists(input_path):
         os.remove(input_path)
@@ -1102,63 +1687,72 @@ def handle_photo(message):
         o.write(output_image)
       with open(output_path, "rb") as doc:
         bot.send_document(
-            chat_id, doc, caption="✂️ <b>Фон успешно удален!</b>", parse_mode="HTML"
+            chat_id,
+            doc,
+            caption="✂️ <b>Фон успешно удален!</b>",
+            parse_mode="HTML",
         )
       bot.delete_message(chat_id, processing_msg.message_id)
     except Exception as e:
+      print(f"Ошибка удаления фона: {e}")
       bot.send_message(chat_id, "❌ Ошибка при обработке фото.")
     finally:
       if os.path.exists(input_path):
         os.remove(input_path)
       if os.path.exists(output_path):
         os.remove(output_path)
-  else:
-    processing_msg = bot.send_message(
-        chat_id, "✨ <b>Улучшение качества...</b>", parse_mode="HTML"
-    )
-    try:
-      file_info = bot.get_file(message.photo[-1].file_id)
-      downloaded_file = bot.download_file(file_info.file_path)
-      with open(temp_in, "wb") as f:
-        f.write(downloaded_file)
-      img = Image.open(temp_in).convert("RGB")
-      img = ImageEnhance.Sharpness(img).enhance(1.3)
-      img = ImageEnhance.Color(img).enhance(1.1)
-      img.save(temp_out, quality=95)
-      with open(temp_out, "rb") as photo_to_send:
-        bot.send_photo(
-            chat_id,
-            photo_to_send,
-            caption="✨ <b>Качество улучшено!</b>",
-            parse_mode="HTML",
-        )
-      bot.delete_message(chat_id, processing_msg.message_id)
-    except Exception as e:
-      bot.send_message(message.chat.id, "❌ Не удалось улучшить фото.")
-    finally:
-      if os.path.exists(temp_in):
-        os.remove(temp_in)
-      if os.path.exists(temp_out):
-        os.remove(temp_out)
+    return
+
+  processing_msg = bot.send_message(
+      chat_id, "✨ <b>Улучшение качества...</b>", parse_mode="HTML"
+  )
+  try:
+    file_info = bot.get_file(message.photo[-1].file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+    with open(temp_in, "wb") as f:
+      f.write(downloaded_file)
+    img = Image.open(temp_in).convert("RGB")
+    img = ImageEnhance.Sharpness(img).enhance(1.3)
+    img = ImageEnhance.Color(img).enhance(1.1)
+    img.save(temp_out, quality=95)
+    with open(temp_out, "rb") as photo_to_send:
+      bot.send_photo(
+          chat_id,
+          photo_to_send,
+          caption="✨ <b>Качество улучшено!</b>",
+          parse_mode="HTML",
+      )
+    bot.delete_message(chat_id, processing_msg.message_id)
+  except Exception as e:
+    print(f"Ошибка улучшения фото: {e}")
+    bot.send_message(chat_id, "❌ Не удалось улучшить фото.")
+  finally:
+    if os.path.exists(temp_in):
+      os.remove(temp_in)
+    if os.path.exists(temp_out):
+      os.remove(temp_out)
 
 
+# ================================================================
+# 16. ОБЫЧНЫЕ ТЕКСТОВЫЕ СООБЩЕНИЯ — GOAT CHAT
+# ================================================================
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
   user_id = message.from_user.id
-  if not check_subscription(user_id):
-    bot.send_message(
-        message.chat.id,
-        "🔒 Сначала подпишитесь на канал!",
-        reply_markup=get_sub_markup(),
-    )
+  username = message.from_user.first_name or "друг"
+  if not require_subscription(message.chat.id, user_id):
     return
 
-  conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
+  ensure_user(user_id, username)
+
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute(
       "UPDATE scores SET messages_count = messages_count + 1 WHERE user_id = ?",
       (user_id,),
   )
+  cursor.execute("SELECT active_mode FROM scores WHERE user_id = ?", (user_id,))
+  mode_row = cursor.fetchone()
   conn.commit()
   conn.close()
 
@@ -1168,8 +1762,11 @@ def handle_message(message):
 
   bot.send_chat_action(message.chat.id, "typing")
 
-  current_mode_key = user_modes.get(message.chat.id, "default")
-  role_info = ROLES.get(current_mode_key, ROLES["default"])
+  current_mode_key = user_modes.get(
+      message.chat.id,
+      mode_row[0] if mode_row and mode_row[0] in ROLES else DEFAULT_ROLE_KEY,
+  )
+  role_info = ROLES.get(current_mode_key, ROLES[DEFAULT_ROLE_KEY])
   system_prompt = role_info["system"]
   role_name = role_info["name"]
   show_header = role_info.get("show_header", True)
@@ -1183,9 +1780,6 @@ def handle_message(message):
         model=GROQ_MODEL,
     )
     answer = chat_completion.choices[0].message.content.strip()
-
-    import re
-
     answer = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", answer)
 
     if show_header:
@@ -1194,6 +1788,10 @@ def handle_message(message):
       formatted_response = answer
 
     bot.send_message(message.chat.id, formatted_response, parse_mode="HTML")
+
+    leveled_up, new_level, coins, xp = add_xp(user_id, username, 3)
+    if leveled_up:
+      send_level_up_message(message.chat.id, new_level, coins)
   except Exception as e:
     print(f"Ошибка Groq API: {e}")
     bot.send_message(
@@ -1201,6 +1799,9 @@ def handle_message(message):
     )
 
 
+# ================================================================
+# 17. ЗАПУСК
+# ================================================================
 def run_bot():
   print("Бот запущен и полностью готов к работе со всеми функциями!")
   bot.infinity_polling(skip_pending=True)
