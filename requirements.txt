@@ -3,4 +3,4 @@ pyTelegramBotAPI
 groq
 Pillow
 rembg[cpu]
-
+requests
