@@ -16,14 +16,14 @@ from telebot import types
 # 1. БАЗА ДАННЫХ
 # ================================================================
 
-DB_PATH = "leaderboard.db"
+DB_PATH = os.environ.get("DB_PATH", "leaderboard.db")
 
 
 def _add_column_if_missing(cursor, table, column, coltype):
   try:
     cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
   except sqlite3.OperationalError:
-    pass
+    pass  # колонка уже существует
 
 
 def init_db():
@@ -41,6 +41,7 @@ def init_db():
             settings TEXT DEFAULT 'RU'
         )
     """)
+  # Миграции для новой системы прогресса (XP/уровни/монеты)
   _add_column_if_missing(cursor, "scores", "xp", "INTEGER DEFAULT 0")
   _add_column_if_missing(cursor, "scores", "level", "INTEGER DEFAULT 1")
   _add_column_if_missing(cursor, "scores", "coins", "INTEGER DEFAULT 0")
@@ -54,6 +55,7 @@ init_db()
 
 
 def ensure_user(user_id, username):
+  """Гарантирует наличие строки пользователя в БД."""
   conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute("SELECT user_id FROM scores WHERE user_id = ?", (user_id,))
@@ -78,6 +80,9 @@ def xp_needed_for_level(level):
 
 
 def add_xp(user_id, username, amount):
+  """Начисляет XP, обрабатывает повышение уровня и награду монетами.
+
+  Возвращает (leveled_up: bool, new_level: int, coins: int, xp: int)."""
   ensure_user(user_id, username)
   conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
@@ -123,6 +128,59 @@ def get_profile_row(user_id):
   return row, place
 
 
+import base64
+import io
+
+
+def analyze_photo_with_ai(image_path, system_prompt):
+  """Отправляет фото в vision-модель Groq и возвращает реальный разбор
+  именно этого изображения (а не заготовленный текст)."""
+  with open(image_path, "rb") as f:
+    b64_image = base64.b64encode(f.read()).decode("utf-8")
+
+  completion = groq_client.chat.completions.create(
+      model=GROQ_VISION_MODEL,
+      messages=[
+          {"role": "system", "content": system_prompt},
+          {
+              "role": "user",
+              "content": [
+                  {
+                      "type": "text",
+                      "text": "Проанализируй это изображение согласно своей роли.",
+                  },
+                  {
+                      "type": "image_url",
+                      "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                  },
+              ],
+          },
+      ],
+      temperature=0.7,
+      max_completion_tokens=800,
+  )
+  return completion.choices[0].message.content.strip()
+
+
+def fetch_pollinations_image(url, timeout=120, retries=2):
+  """Скачивает сгенерированное изображение с Pollinations сами, а не отдаём
+  ссылку напрямую в Telegram. Генерация (особенно img2img/kontext) может
+  занимать больше времени, чем Telegram готов ждать при скачивании фото по
+  URL — из-за этого редактирование фото часто вообще не приходило"""
+  last_error = None
+  for attempt in range(retries):
+    try:
+      resp = requests.get(url, timeout=timeout)
+      if resp.status_code == 200 and resp.content:
+        return resp.content
+      last_error = f"HTTP {resp.status_code}"
+    except Exception as e:
+      last_error = str(e)
+    print(f"Ошибка скачивания изображения (попытка {attempt + 1}/{retries}):"
+          f" {last_error}")
+  return None
+
+
 def render_bar(current, total, length=10):
   if total <= 0:
     filled = 0
@@ -156,15 +214,16 @@ if not groq_api_key:
   print("⚠️ Предупреждение: GROQ_API_KEY не найден в Secrets!")
 
 groq_client = Groq(api_key=groq_api_key)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"  # llama-3.3-70b-versatile отключается 16.08.26
+GROQ_VISION_MODEL = "qwen/qwen3.6-27b"  # модель с поддержкой изображений
 
 CHANNEL_ID = "@goatai_news"
 CHANNEL_URL = "https://t.me/goatai_news"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 
-user_modes = {}
-game_sessions = {}
-user_states = {}
+user_modes = {}      # chat_id -> ключ роли GOAT Chat (в памяти, для скорости)
+game_sessions = {}   # user_id -> состояние текущей игры
+user_states = {}     # user_id -> строка состояния ожидания (фото/текст)
 
 input_path = "input_photo.jpg"
 output_path = "output_no_bg.png"
@@ -173,8 +232,11 @@ temp_out = "temp_out.jpg"
 
 HONESTY_RULE = (
     "Правило: твой анализ всегда честный. Без лести. Без грубости."
-    " Только аргументы и конкретные, применимые советы. Пиши структурированно"
-    " (короткие пункты), без воды. Пиши строго на русском языке."
+    " Только аргументы и конкретные, применимые советы. Пиши строго на"
+    " русском языке. Отвечай простыми словами, без сложных терминов и"
+    " профессионального жаргона — как будто объясняешь другу. Формат: 3-4"
+    " коротких пункта, без воды. Пиши предметно именно про то, что видишь"
+    " на этом конкретном фото или в этом тексте, а не общими фразами."
 )
 
 # ================================================================
@@ -253,14 +315,16 @@ ROLES = {
         "name": "🤬 Грубиян",
         "show_header": True,
         "system": (
-            "Ты — максимально токсичный, едкий и угарный циник с черным юмором,"
-            " который отвечает на вопросы по существу, но при этом сочно"
-            " обзывается и мастерски кроет матом. НЕ матерись через каждое слово"
-            " и не пиши сплошной мат — используй крепкое словцо или мат точечно,"
-            " исключительно для убойного панчлайна, сарказма или смешной"
-            " аналогии, чтобы это звучало жизненно и уморительно. Обращайся к"
-            " пользователю на «ты», подкалывай его за тупые вопросы, но всё же"
-            " давай дельные ответы. Пиши строго на русском языке."
+            "Ты — дерзкий, прямолинейный персонаж без фильтров, реально"
+            " материшься в речи — используешь русский мат свободно, в"
+            " каждом сообщении, как обычную часть своей речи, а не редкую"
+            " приправу. Общаешься с пользователем на «ты», грубо, с"
+            " сарказмом и чёрным юмором. При этом ты всё равно по существу"
+            " отвечаешь на вопрос пользователя — просто делаешь это"
+            " матерно и без обиняков. Не оскорбляешь пользователя лично и"
+            " не переходишь на темы дискриминации — мат используешь как"
+            " экспрессию речи (междометия, усилители, связки), а не как"
+            " оскорбления в адрес человека. Пиши строго на русском языке."
         ),
     },
 }
@@ -274,35 +338,35 @@ ANALYSIS_CATEGORIES = {
         "label": "👤 Внешность",
         "type": "photo",
         "system": (
-            "Ты — тактичный и наблюдательный стилист-консультант. Оцениваешь"
-            " образ человека по фото: сочетание цветов, посадка одежды,"
-            " опрятность, общее впечатление. " + HONESTY_RULE
+            "Ты — дружелюбный стилист. Простыми словами говоришь, идёт ли"
+            " человеку то, что на нём надето, сочетается ли по цвету и"
+            " стилю, и что можно было бы поменять. " + HONESTY_RULE
         ),
     },
     "photo": {
         "label": "📷 Фото",
         "type": "photo",
         "system": (
-            "Ты — профессиональный фотограф-критик. Оцениваешь композицию,"
-            " свет, резкость, цветокоррекцию и общее визуальное впечатление"
-            " от кадра. " + HONESTY_RULE
+            "Ты — фотограф-друг. Простыми словами говоришь, удачный ли"
+            " кадр: получилось интересно или скучно, что в кадре мешает,"
+            " а что цепляет взгляд. " + HONESTY_RULE
         ),
     },
     "design": {
         "label": "🎨 Дизайн",
         "type": "photo",
         "system": (
-            "Ты — арт-директор с большим опытом графического дизайна."
-            " Оцениваешь композицию, типографику, цветовую палитру и"
-            " визуальную иерархию присланного макета. " + HONESTY_RULE
+            "Ты — дизайнер-практик. Простыми словами говоришь, удобно ли"
+            " смотрится макет, не перегружен ли он, читается ли главное"
+            " с первого взгляда. " + HONESTY_RULE
         ),
     },
     "text": {
         "label": "📝 Текст",
         "type": "text",
         "system": (
-            "Ты — опытный редактор и копирайтер. Разбираешь присланный текст:"
-            " стиль, структура, грамотность, убедительность, лишние слова."
+            "Ты — редактор-практик. Простыми словами говоришь, легко ли"
+            " читается текст, где лишние слова, где мысль потерялась."
             " " + HONESTY_RULE
         ),
     },
@@ -310,41 +374,40 @@ ANALYSIS_CATEGORIES = {
         "label": "💡 Идея",
         "type": "text",
         "system": (
-            "Ты — продуктовый стратег и предприниматель с большим опытом."
-            " Оцениваешь присланную идею: сильные стороны, слабые места,"
-            " риски, реалистичность, что нужно проверить в первую очередь."
-            " " + HONESTY_RULE
+            "Ты — предприниматель-практик. Простыми словами говоришь, есть"
+            " ли в идее смысл, что в ней слабое место и что стоит"
+            " проверить в первую очередь. " + HONESTY_RULE
         ),
     },
     "code": {
         "label": "💻 Код",
         "type": "text",
         "system": (
-            "Ты — senior-разработчик и внимательный код-ревьюер. Разбираешь"
-            " присланный код: логические и синтаксические ошибки, стиль,"
-            " потенциальные баги, что можно улучшить. " + HONESTY_RULE
+            "Ты — опытный разработчик. Простыми словами говоришь, что не"
+            " так в коде, где может быть баг и как это поправить."
+            " " + HONESTY_RULE
         ),
     },
     "interface": {
         "label": "📱 Интерфейс",
         "type": "photo",
         "system": (
-            "Ты — UX/UI-дизайнер с опытом проектирования мобильных и"
-            " веб-интерфейсов. Оцениваешь присланный скриншот интерфейса:"
-            " удобство, читаемость, консистентность, доступность."
-            " " + HONESTY_RULE
+            "Ты — практик по интерфейсам. Простыми словами говоришь,"
+            " удобно ли пользоваться этим экраном, не запутается ли"
+            " человек, что не сразу понятно. " + HONESTY_RULE
         ),
     },
     "business": {
         "label": "📈 Бизнес",
         "type": "text",
         "system": (
-            "Ты — бизнес-консультант с опытом в стратегии и финансах."
-            " Разбираешь присланное описание бизнеса или ситуации: сильные и"
-            " слабые стороны, точки роста, риски. " + HONESTY_RULE
+            "Ты — практичный бизнес-советчик. Простыми словами говоришь,"
+            " что сильное, а что слабое в описанном деле, и что делать"
+            " дальше. " + HONESTY_RULE
         ),
     },
 }
+
 
 # ================================================================
 # 6. ВИКТОРИНА «ПРАВДА ИЛИ ЛОЖЬ» — база вопросов
@@ -669,6 +732,7 @@ QUESTIONS = [
     },
 ]
 
+
 # ================================================================
 # 7. ПОДПИСКА НА КАНАЛ
 # ================================================================
@@ -694,6 +758,7 @@ def get_sub_markup():
 
 
 def require_subscription(chat_id, user_id):
+  """Возвращает True, если доступ разрешен. Иначе сама шлет сообщение."""
   if check_subscription(user_id):
     return True
   bot.send_message(
@@ -705,7 +770,7 @@ def require_subscription(chat_id, user_id):
 
 
 # ================================================================
-# 8. ГЛАВНОЕ МЕНЮ (компактное)
+# 8. ГЛАВНОЕ МЕНЮ (компактное, 5 разделов)
 # ================================================================
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
@@ -732,10 +797,12 @@ def send_main_menu(chat_id, user_name):
   markup = types.InlineKeyboardMarkup(row_width=2)
   markup.add(
       types.InlineKeyboardButton(
-          "🎮 Игра", callback_data="start_chat_game"
+          "🎮 Игра «Правда или Ложь»", callback_data="start_chat_game"
       ),
+  )
+  markup.add(
       types.InlineKeyboardButton("🐐 GOAT Chat", callback_data="goat_chat"),
-      types.InlineKeyboardButton("🔍 Анализ", callback_data="goat_analysis"),
+      types.InlineKeyboardButton("🔍 GOAT Анализ", callback_data="goat_analysis"),
       types.InlineKeyboardButton("🎨 Генерация", callback_data="ask_draw"),
       types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
       types.InlineKeyboardButton("🏆 Лидеры", callback_data="show_leaderboard"),
@@ -779,9 +846,10 @@ def send_help(message):
       "📖 <b>Справочник по командам:</b>\n🔹 <code>/start</code> —"
       " Перезапустить бота\n🔹 <code>/game</code> — Игра «Правда или"
       " Ложь»\n🔹 <code>/top</code> — Таблица лидеров\n🔹"
-      " <code>/admin</code> — Панель администратора\n\n🔍 <b>GOAT Анализ:</b>"
-      " выберите категорию в меню и пришлите фото или текст.\n🐐 <b>GOAT"
-      " Chat:</b> выберите личность ИИ и просто пишите сообщения."
+      " <code>/admin</code> — Панель администратора (только для"
+      " админа)\n\n🔍 <b>GOAT Анализ:</b> выберите категорию в меню и"
+      " пришлите фото или текст.\n🐐 <b>GOAT Chat:</b> выберите личность"
+      " ИИ и просто пишите сообщения."
   )
   bot.send_message(message.chat.id, help_text, parse_mode="HTML")
 
@@ -813,7 +881,7 @@ def cmd_admin(message):
 
 
 # ================================================================
-# 9. GOAT CHAT
+# 9. GOAT CHAT — выбор личности ИИ
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "goat_chat")
 def cb_goat_chat(call):
@@ -844,7 +912,8 @@ def cb_goat_chat(call):
   text = (
       "🐐 <b>GOAT Chat</b>\nВыберите личность ИИ, с которой хотите"
       f" общаться.\n\n⭐ Сейчас активна: <b>{current_name}</b>\n\nПосле"
-      " выбора просто пишите сообщения в чат."
+      " выбора просто пишите сообщения в чат — бот будет отвечать в"
+      " выбранном стиле."
   )
   bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
 
@@ -874,7 +943,7 @@ def cb_set_mode(call):
 
 
 # ================================================================
-# 10. GOAT АНАЛИЗ (с генерацией уникального ответа)
+# 10. GOAT АНАЛИЗ
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "goat_analysis")
 def cb_goat_analysis(call):
@@ -890,7 +959,8 @@ def cb_goat_analysis(call):
   )
   text = (
       "🔍 <b>GOAT Анализ</b>\nВыберите, что разобрать.\n\n<i>GOAT Анализ"
-      " всегда честный — без лести, только аргументы и советы.</i>"
+      " всегда честный — без лести и без грубости, только аргументы и"
+      " советы.</i>"
   )
   bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
 
@@ -913,8 +983,7 @@ def cb_analysis_category(call):
     user_states[user_id] = f"waiting_analysis:{key}"
     bot.send_message(
         call.message.chat.id,
-        f"{category['label']}\n\n📸 Пришлите фотографию для уникального"
-        " анализа.",
+        f"{category['label']}\n\n📸 Пришлите фотографию для анализа.",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -969,9 +1038,7 @@ def process_text_analysis(message, category_key):
             "🏠 Главное меню", callback_data="back_to_menu"
         )
     )
-    text = (
-        f"📊 <b>GOAT Анализ: {category['label']}</b>\n\n{answer}\n\n<i>+20 XP</i>"
-    )
+    text = f"{category['label']}\n\n{answer}\n\n<i>+20 XP</i>"
     bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
 
     if leveled_up:
@@ -991,7 +1058,7 @@ def send_level_up_message(chat_id, new_level, coins):
 
 
 # ================================================================
-# 11. ПРОФИЛЬ
+# 11. ПРОФИЛЬ (уровень, XP, монеты)
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "profile")
 def cb_profile(call):
@@ -1040,7 +1107,7 @@ def cb_profile(call):
 
 
 # ================================================================
-# 12. НАСТРОЙКИ
+# 12. НАСТРОЙКИ (компактные)
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "settings")
 def cb_settings(call):
@@ -1098,14 +1165,14 @@ def cb_settings_about(call):
   bot.answer_callback_query(call.id)
   bot.send_message(
       call.message.chat.id,
-      "ℹ️ <b>GOAT AI</b>\nВерсия: 3.1\nИИ-помощник с личностями, уникальным"
-      " анализом фото, викториной и прогрессом.",
+      "ℹ️ <b>GOAT AI</b>\nВерсия: 3.0\nИИ-помощник с личностями, честным"
+      " анализом, викториной и системой прогресса.",
       parse_mode="HTML",
   )
 
 
 # ================================================================
-# 13. ВИКТОРИНА
+# 13. ВИКТОРИНА «ПРАВДА ИЛИ ЛОЖЬ»
 # ================================================================
 @bot.message_handler(commands=["game"])
 def command_start_game(message):
@@ -1227,7 +1294,7 @@ def cb_game_answer(call):
   place = cursor.fetchone()[0] + 1
   conn.close()
 
-  xp_gain = 10 if user_choice != correct else 25
+  xp_gain = 10 if user_choice != correct else 25  # база 10 за игру + бонус за победу
   leveled_up, new_level, coins, xp = add_xp(user_id, username, xp_gain)
 
   if len(session["used_questions"]) >= len(QUESTIONS):
@@ -1347,6 +1414,7 @@ def cb_show_leaderboard(call):
 # 14. ГЕНЕРАЦИЯ И РЕДАКТИРОВАНИЕ ИЗОБРАЖЕНИЙ
 # ================================================================
 def translate_to_english(text):
+  """Переводит короткий промпт на английский через Groq для лучшего качества."""
   completion = groq_client.chat.completions.create(
       messages=[
           {
@@ -1390,6 +1458,13 @@ def _upload_to_0x0(file_path):
 
 
 def upload_temp_image(file_path, expire="1h"):
+  """Загружает файл на анонимный временный хостинг и возвращает публичный URL.
+
+  Пробует несколько бесплатных хостингов без регистрации (используем для
+  img2img, чтобы не передавать во внешний сервис постоянную ссылку или токен
+  бота). Каждый хостинг пробуется дважды на случай кратковременного сбоя,
+  затем идёт переключение на следующий — так один нестабильный сервис не
+  роняет всю функцию."""
   uploaders = [
       ("Litterbox", lambda: _upload_to_litterbox(file_path, expire)),
       ("0x0.st", lambda: _upload_to_0x0(file_path)),
@@ -1399,7 +1474,8 @@ def upload_temp_image(file_path, expire="1h"):
       try:
         return uploader()
       except Exception as e:
-        print(f"Ошибка загрузки временного фото через {name}: {e}")
+        print(f"Ошибка загрузки временного фото через {name} (попытка"
+              f" {attempt + 1}/2): {e}")
   return None
 
 
@@ -1451,6 +1527,7 @@ def process_image_prompt(message):
 
   try:
     english_prompt = translate_to_english(prompt)
+
     seed = random.randint(1, 1000000)
     encoded_prompt = urllib.parse.quote(english_prompt)
     image_url = (
@@ -1459,9 +1536,19 @@ def process_image_prompt(message):
         f"&seed={seed}"
     )
 
+    image_bytes = fetch_pollinations_image(image_url)
+    if not image_bytes:
+      bot.send_message(
+          message.chat.id,
+          "❌ Сервис генерации сейчас не отвечает. Попробуйте ещё раз через"
+          " минуту.",
+      )
+      bot.delete_message(message.chat.id, status_msg.message_id)
+      return
+
     bot.send_photo(
         message.chat.id,
-        image_url,
+        io.BytesIO(image_bytes),
         caption=f"✨ <b>Запрос:</b> {prompt}",
         parse_mode="HTML",
     )
@@ -1521,7 +1608,9 @@ def process_edit_prompt(message, source_photo_path):
     hosted_url = upload_temp_image(source_photo_path, expire="1h")
     if not hosted_url:
       bot.send_message(
-          chat_id, "❌ Не удалось загрузить фото для обработки."
+          chat_id,
+          "❌ Не удалось загрузить фото для обработки — временный хостинг"
+          " сейчас недоступен. Подождите немного и попробуйте ещё раз.",
       )
       return
 
@@ -1535,9 +1624,19 @@ def process_edit_prompt(message, source_photo_path):
         f"&width=1024&height=1024&nologo=true"
     )
 
+    image_bytes = fetch_pollinations_image(edit_url)
+    if not image_bytes:
+      bot.send_message(
+          chat_id,
+          "❌ Сервис генерации сейчас не отвечает. Попробуйте ещё раз через"
+          " минуту.",
+      )
+      bot.delete_message(chat_id, status_msg.message_id)
+      return
+
     bot.send_photo(
         chat_id,
-        edit_url,
+        io.BytesIO(image_bytes),
         caption=f"🖌 <b>Изменено:</b> {prompt}",
         parse_mode="HTML",
     )
@@ -1557,7 +1656,7 @@ def process_edit_prompt(message, source_photo_path):
 
 
 # ================================================================
-# 15. ОБРАБОТКА ФОТО (Уникальный анализ + инструменты обработки)
+# 15. ОБРАБОТКА ФОТО (анализ / удаление фона / улучшение качества)
 # ================================================================
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
@@ -1585,15 +1684,14 @@ def handle_photo(message):
 
     msg = bot.send_message(
         chat_id,
-        "📝 Опишите, как изменить это фото (например: «добавь киберпанк стиль»"
-        " или «сделай черно-белым»):",
+        "📝 Опишите, что изменить на фото (например: «сделай в стиле"
+        " акварели» или «добавь снег»):",
     )
     bot.register_next_step_handler(
         msg, lambda m, p=edit_source_path: process_edit_prompt(m, p)
     )
     return
 
-  # Уникальный GOAT Анализ фото через Groq API
   if state.startswith("waiting_analysis:"):
     category_key = state.split(":", 1)[1]
     category = ANALYSIS_CATEGORIES.get(category_key)
@@ -1610,26 +1708,7 @@ def handle_photo(message):
       with open(input_path, "wb") as f:
         f.write(downloaded_file)
 
-      hosted_url = upload_temp_image(input_path, expire="1h")
-
-      prompt_text = (
-          f"Сделай детальный, уникальный и развернутый разбор в категории '{category['label']}'."
-          f" Опиши сильные стороны, слабые места и дай 2-3 конкретных совета по улучшению."
-          f" Ссылка на изображение для контекста: {hosted_url}. "
-          f"Напиши профессионально, честно, без воды, строго на русском языке."
-      )
-
-      completion = groq_client.chat.completions.create(
-          messages=[
-              {"role": "system", "content": category["system"]},
-              {"role": "user", "content": prompt_text},
-          ],
-          model=GROQ_MODEL,
-      )
-      expert_text = completion.choices[0].message.content.strip()
-      expert_text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", expert_text)
-
-      formatted_output = f"📊 <b>GOAT Анализ: {category['label']}</b>\n\n{expert_text}"
+      expert_text = analyze_photo_with_ai(input_path, category["system"])
 
       leveled_up, new_level, coins, xp = add_xp(
           user_id, message.from_user.first_name or "друг", 20
@@ -1643,7 +1722,7 @@ def handle_photo(message):
       )
       bot.send_message(
           chat_id,
-          formatted_output + "\n\n<i>+20 XP</i>",
+          expert_text + "\n\n<i>+20 XP</i>",
           reply_markup=markup,
           parse_mode="HTML",
       )
@@ -1723,7 +1802,7 @@ def handle_photo(message):
 
 
 # ================================================================
-# 16. ТЕКСТОВЫЕ СООБЩЕНИЯ (GOAT Chat)
+# 16. ОБЫЧНЫЕ ТЕКСТОВЫЕ СООБЩЕНИЯ — GOAT CHAT
 # ================================================================
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
