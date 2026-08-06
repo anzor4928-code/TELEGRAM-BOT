@@ -23,7 +23,7 @@ def _add_column_if_missing(cursor, table, column, coltype):
   try:
     cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
   except sqlite3.OperationalError:
-    pass  # колонка уже существует
+    pass
 
 
 def init_db():
@@ -41,7 +41,6 @@ def init_db():
             settings TEXT DEFAULT 'RU'
         )
     """)
-  # Миграции для новой системы прогресса (XP/уровни/монеты)
   _add_column_if_missing(cursor, "scores", "xp", "INTEGER DEFAULT 0")
   _add_column_if_missing(cursor, "scores", "level", "INTEGER DEFAULT 1")
   _add_column_if_missing(cursor, "scores", "coins", "INTEGER DEFAULT 0")
@@ -55,7 +54,6 @@ init_db()
 
 
 def ensure_user(user_id, username):
-  """Гарантирует наличие строки пользователя в БД."""
   conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute("SELECT user_id FROM scores WHERE user_id = ?", (user_id,))
@@ -80,9 +78,6 @@ def xp_needed_for_level(level):
 
 
 def add_xp(user_id, username, amount):
-  """Начисляет XP, обрабатывает повышение уровня и награду монетами.
-
-  Возвращает (leveled_up: bool, new_level: int, coins: int, xp: int)."""
   ensure_user(user_id, username)
   conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
@@ -167,9 +162,9 @@ CHANNEL_ID = "@goatai_news"
 CHANNEL_URL = "https://t.me/goatai_news"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 
-user_modes = {}      # chat_id -> ключ роли GOAT Chat (в памяти, для скорости)
-game_sessions = {}   # user_id -> состояние текущей игры
-user_states = {}     # user_id -> строка состояния ожидания (фото/текст)
+user_modes = {}
+game_sessions = {}
+user_states = {}
 
 input_path = "input_photo.jpg"
 output_path = "output_no_bg.png"
@@ -258,17 +253,14 @@ ROLES = {
         "name": "🤬 Грубиян",
         "show_header": True,
         "system": (
-            "Ты — язвительный, остроумный персонаж с характером и чувством"
-            " юмора, немного уставший от всего на свете циник. Общаешься с"
-            " пользователем на «ты», используешь крепкие выражения и мат, но"
-            " с умом: мат — это приправа для шутки, а не замена содержания."
-            " У тебя острый черный юмор, неожиданные сравнения и живая,"
-            " естественная манера речи — как будто отвечает реальный"
-            " человек, а не робот. Не материшься через слово ради самого"
-            " мата — используешь его точечно, там, где это смешно или"
-            " усиливает панчлайн. При этом ты всё равно по существу отвечаешь"
-            " на вопрос пользователя — просто делаешь это едко и с сарказмом,"
-            " а не хамишь бессмысленно. Пиши строго на русском языке."
+            "Ты — максимально токсичный, едкий и угарный циник с черным юмором,"
+            " который отвечает на вопросы по существу, но при этом сочно"
+            " обзывается и мастерски кроет матом. НЕ матерись через каждое слово"
+            " и не пиши сплошной мат — используй крепкое словцо или мат точечно,"
+            " исключительно для убойного панчлайна, сарказма или смешной"
+            " аналогии, чтобы это звучало жизненно и уморительно. Обращайся к"
+            " пользователю на «ты», подкалывай его за тупые вопросы, но всё же"
+            " давай дельные ответы. Пиши строго на русском языке."
         ),
     },
 }
@@ -353,45 +345,6 @@ ANALYSIS_CATEGORIES = {
         ),
     },
 }
-
-PHOTO_ANALYSIS_TEMPLATES = {
-    "appearance": (
-        "📊 <b>GOAT Анализ: Внешность</b>\n\n• <b>Общее впечатление:</b>"
-        " образ выглядит собранным, цвета сочетаются между собой.\n•"
-        " <b>Посадка одежды:</b> вещи сидят по фигуре, силуэт не"
-        " перегружен.\n• <b>Что усилить:</b> добавьте один яркий акцент"
-        " (аксессуар или деталь), чтобы образ запоминался сильнее.\n• <b>Совет:"
-        "</b> проверьте образ при дневном свете — это лучший тест на"
-        " сочетаемость цветов."
-    ),
-    "photo": (
-        "📊 <b>GOAT Анализ: Фото</b>\n\n• <b>Композиция:</b> кадр выстроен"
-        " достаточно гармонично, объект в фокусе внимания.\n• <b>Свет:</b>"
-        " освещение мягкое, резких пересветов не видно.\n• <b>Что улучшить:"
-        "</b> добавьте немного контраста и лёгкую виньетку для глубины"
-        " кадра.\n• <b>Совет:</b> снимайте в золотой час — свет станет"
-        " заметно выразительнее."
-    ),
-    "design": (
-        "📊 <b>GOAT Анализ: Дизайн</b>\n\n• <b>Композиция:</b> элементы"
-        " расставлены по сетке, визуальный баланс соблюден.\n•"
-        " <b>Типографика:</b> шрифтовая пара читаема, но можно усилить"
-        " контраст размеров между заголовком и текстом.\n• <b>Цвет:</b>"
-        " палитра гармонична, но не хватает одного акцентного цвета для"
-        " call-to-action.\n• <b>Совет:</b> увеличьте отступы между блоками —"
-        " воздух в макете работает на восприятие."
-    ),
-    "interface": (
-        "📊 <b>GOAT Анализ: Интерфейс</b>\n\n• <b>Навигация:</b> основные"
-        " действия расположены предсказуемо, структура понятна.\n•"
-        " <b>Читаемость:</b> текст и иконки достаточно контрастны.\n• <b>Что"
-        " улучшить:</b> проверьте размер тапаемых зон кнопок — на мобильном"
-        " они должны быть не меньше 44×44 px.\n• <b>Совет:</b> добавьте"
-        " состояние загрузки для длительных действий — так интерфейс не"
-        " будет казаться зависшим."
-    ),
-}
-
 
 # ================================================================
 # 6. ВИКТОРИНА «ПРАВДА ИЛИ ЛОЖЬ» — база вопросов
@@ -716,7 +669,6 @@ QUESTIONS = [
     },
 ]
 
-
 # ================================================================
 # 7. ПОДПИСКА НА КАНАЛ
 # ================================================================
@@ -742,7 +694,6 @@ def get_sub_markup():
 
 
 def require_subscription(chat_id, user_id):
-  """Возвращает True, если доступ разрешен. Иначе сама шлет сообщение."""
   if check_subscription(user_id):
     return True
   bot.send_message(
@@ -754,7 +705,7 @@ def require_subscription(chat_id, user_id):
 
 
 # ================================================================
-# 8. ГЛАВНОЕ МЕНЮ (компактное, 5 разделов)
+# 8. ГЛАВНОЕ МЕНЮ (компактное)
 # ================================================================
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
@@ -778,13 +729,13 @@ def send_welcome(message):
 
 
 def send_main_menu(chat_id, user_name):
-  markup = types.InlineKeyboardMarkup(row_width=1)
+  markup = types.InlineKeyboardMarkup(row_width=2)
   markup.add(
       types.InlineKeyboardButton(
-          "🎮 Игра «Правда или Ложь»", callback_data="start_chat_game"
+          "🎮 Игра", callback_data="start_chat_game"
       ),
       types.InlineKeyboardButton("🐐 GOAT Chat", callback_data="goat_chat"),
-      types.InlineKeyboardButton("🔍 GOAT Анализ", callback_data="goat_analysis"),
+      types.InlineKeyboardButton("🔍 Анализ", callback_data="goat_analysis"),
       types.InlineKeyboardButton("🎨 Генерация", callback_data="ask_draw"),
       types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
       types.InlineKeyboardButton("🏆 Лидеры", callback_data="show_leaderboard"),
@@ -828,10 +779,9 @@ def send_help(message):
       "📖 <b>Справочник по командам:</b>\n🔹 <code>/start</code> —"
       " Перезапустить бота\n🔹 <code>/game</code> — Игра «Правда или"
       " Ложь»\n🔹 <code>/top</code> — Таблица лидеров\n🔹"
-      " <code>/admin</code> — Панель администратора (только для"
-      " админа)\n\n🔍 <b>GOAT Анализ:</b> выберите категорию в меню и"
-      " пришлите фото или текст.\n🐐 <b>GOAT Chat:</b> выберите личность"
-      " ИИ и просто пишите сообщения."
+      " <code>/admin</code> — Панель администратора\n\n🔍 <b>GOAT Анализ:</b>"
+      " выберите категорию в меню и пришлите фото или текст.\n🐐 <b>GOAT"
+      " Chat:</b> выберите личность ИИ и просто пишите сообщения."
   )
   bot.send_message(message.chat.id, help_text, parse_mode="HTML")
 
@@ -863,7 +813,7 @@ def cmd_admin(message):
 
 
 # ================================================================
-# 9. GOAT CHAT — выбор личности ИИ
+# 9. GOAT CHAT
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "goat_chat")
 def cb_goat_chat(call):
@@ -894,8 +844,7 @@ def cb_goat_chat(call):
   text = (
       "🐐 <b>GOAT Chat</b>\nВыберите личность ИИ, с которой хотите"
       f" общаться.\n\n⭐ Сейчас активна: <b>{current_name}</b>\n\nПосле"
-      " выбора просто пишите сообщения в чат — бот будет отвечать в"
-      " выбранном стиле."
+      " выбора просто пишите сообщения в чат."
   )
   bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
 
@@ -925,7 +874,7 @@ def cb_set_mode(call):
 
 
 # ================================================================
-# 10. GOAT АНАЛИЗ
+# 10. GOAT АНАЛИЗ (с генерацией уникального ответа)
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "goat_analysis")
 def cb_goat_analysis(call):
@@ -941,8 +890,7 @@ def cb_goat_analysis(call):
   )
   text = (
       "🔍 <b>GOAT Анализ</b>\nВыберите, что разобрать.\n\n<i>GOAT Анализ"
-      " всегда честный — без лести и без грубости, только аргументы и"
-      " советы.</i>"
+      " всегда честный — без лести, только аргументы и советы.</i>"
   )
   bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
 
@@ -965,7 +913,8 @@ def cb_analysis_category(call):
     user_states[user_id] = f"waiting_analysis:{key}"
     bot.send_message(
         call.message.chat.id,
-        f"{category['label']}\n\n📸 Пришлите фотографию для анализа.",
+        f"{category['label']}\n\n📸 Пришлите фотографию для уникального"
+        " анализа.",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -1020,7 +969,9 @@ def process_text_analysis(message, category_key):
             "🏠 Главное меню", callback_data="back_to_menu"
         )
     )
-    text = f"{category['label']}\n\n{answer}\n\n<i>+20 XP</i>"
+    text = (
+        f"📊 <b>GOAT Анализ: {category['label']}</b>\n\n{answer}\n\n<i>+20 XP</i>"
+    )
     bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
 
     if leveled_up:
@@ -1040,7 +991,7 @@ def send_level_up_message(chat_id, new_level, coins):
 
 
 # ================================================================
-# 11. ПРОФИЛЬ (уровень, XP, монеты)
+# 11. ПРОФИЛЬ
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "profile")
 def cb_profile(call):
@@ -1089,7 +1040,7 @@ def cb_profile(call):
 
 
 # ================================================================
-# 12. НАСТРОЙКИ (компактные)
+# 12. НАСТРОЙКИ
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "settings")
 def cb_settings(call):
@@ -1147,14 +1098,14 @@ def cb_settings_about(call):
   bot.answer_callback_query(call.id)
   bot.send_message(
       call.message.chat.id,
-      "ℹ️ <b>GOAT AI</b>\nВерсия: 3.0\nИИ-помощник с личностями, честным"
-      " анализом, викториной и системой прогресса.",
+      "ℹ️ <b>GOAT AI</b>\nВерсия: 3.1\nИИ-помощник с личностями, уникальным"
+      " анализом фото, викториной и прогрессом.",
       parse_mode="HTML",
   )
 
 
 # ================================================================
-# 13. ВИКТОРИНА «ПРАВДА ИЛИ ЛОЖЬ»
+# 13. ВИКТОРИНА
 # ================================================================
 @bot.message_handler(commands=["game"])
 def command_start_game(message):
@@ -1276,7 +1227,7 @@ def cb_game_answer(call):
   place = cursor.fetchone()[0] + 1
   conn.close()
 
-  xp_gain = 10 if user_choice != correct else 25  # база 10 за игру + бонус за победу
+  xp_gain = 10 if user_choice != correct else 25
   leveled_up, new_level, coins, xp = add_xp(user_id, username, xp_gain)
 
   if len(session["used_questions"]) >= len(QUESTIONS):
@@ -1396,7 +1347,6 @@ def cb_show_leaderboard(call):
 # 14. ГЕНЕРАЦИЯ И РЕДАКТИРОВАНИЕ ИЗОБРАЖЕНИЙ
 # ================================================================
 def translate_to_english(text):
-  """Переводит короткий промпт на английский через Groq для лучшего качества."""
   completion = groq_client.chat.completions.create(
       messages=[
           {
@@ -1413,25 +1363,43 @@ def translate_to_english(text):
   return completion.choices[0].message.content.strip()
 
 
-def upload_temp_image(file_path, expire="1h"):
-  """Загружает файл на анонимный временный хостинг и возвращает публичный URL.
+def _upload_to_litterbox(file_path, expire="1h"):
+  with open(file_path, "rb") as f:
+    resp = requests.post(
+        "https://litterbox.catbox.moe/resources/internals/api.php",
+        data={"reqtype": "fileupload", "time": expire},
+        files={"fileToUpload": f},
+        timeout=30,
+    )
+  if resp.status_code == 200 and resp.text.strip().startswith("http"):
+    return resp.text.strip()
+  raise ValueError(f"Litterbox вернул неожиданный ответ: {resp.text[:200]}")
 
-  Используется litterbox.catbox.moe — бесплатно, без регистрации, файл
-  автоматически удаляется через заданное время (используем для img2img,
-  чтобы не передавать во внешний сервис постоянную ссылку или токен бота)."""
-  try:
-    with open(file_path, "rb") as f:
-      resp = requests.post(
-          "https://litterbox.catbox.moe/resources/internals/api.php",
-          data={"reqtype": "fileupload", "time": expire},
-          files={"fileToUpload": f},
-          timeout=60,
-      )
-    if resp.status_code == 200 and resp.text.strip().startswith("http"):
-      return resp.text.strip()
-    print(f"Litterbox вернул неожиданный ответ: {resp.text[:200]}")
-  except Exception as e:
-    print(f"Ошибка загрузки временного фото: {e}")
+
+def _upload_to_0x0(file_path):
+  with open(file_path, "rb") as f:
+    resp = requests.post(
+        "https://0x0.st",
+        files={"file": f},
+        headers={"User-Agent": "GOAT-AI-Bot/1.0"},
+        timeout=30,
+    )
+  if resp.status_code == 200 and resp.text.strip().startswith("http"):
+    return resp.text.strip()
+  raise ValueError(f"0x0.st вернул неожиданный ответ: {resp.text[:200]}")
+
+
+def upload_temp_image(file_path, expire="1h"):
+  uploaders = [
+      ("Litterbox", lambda: _upload_to_litterbox(file_path, expire)),
+      ("0x0.st", lambda: _upload_to_0x0(file_path)),
+  ]
+  for name, uploader in uploaders:
+    for attempt in range(2):
+      try:
+        return uploader()
+      except Exception as e:
+        print(f"Ошибка загрузки временного фото через {name}: {e}")
   return None
 
 
@@ -1483,7 +1451,6 @@ def process_image_prompt(message):
 
   try:
     english_prompt = translate_to_english(prompt)
-
     seed = random.randint(1, 1000000)
     encoded_prompt = urllib.parse.quote(english_prompt)
     image_url = (
@@ -1554,7 +1521,7 @@ def process_edit_prompt(message, source_photo_path):
     hosted_url = upload_temp_image(source_photo_path, expire="1h")
     if not hosted_url:
       bot.send_message(
-          chat_id, "❌ Не удалось загрузить фото для обработки. Попробуйте ещё раз."
+          chat_id, "❌ Не удалось загрузить фото для обработки."
       )
       return
 
@@ -1590,7 +1557,7 @@ def process_edit_prompt(message, source_photo_path):
 
 
 # ================================================================
-# 15. ОБРАБОТКА ФОТО (анализ / удаление фона / улучшение качества)
+# 15. ОБРАБОТКА ФОТО (Уникальный анализ + инструменты обработки)
 # ================================================================
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
@@ -1618,14 +1585,15 @@ def handle_photo(message):
 
     msg = bot.send_message(
         chat_id,
-        "📝 Опишите, что изменить на фото (например: «сделай в стиле"
-        " акварели» или «добавь снег»):",
+        "📝 Опишите, как изменить это фото (например: «добавь киберпанк стиль»"
+        " или «сделай черно-белым»):",
     )
     bot.register_next_step_handler(
         msg, lambda m, p=edit_source_path: process_edit_prompt(m, p)
     )
     return
 
+  # Уникальный GOAT Анализ фото через Groq API
   if state.startswith("waiting_analysis:"):
     category_key = state.split(":", 1)[1]
     category = ANALYSIS_CATEGORIES.get(category_key)
@@ -1642,11 +1610,26 @@ def handle_photo(message):
       with open(input_path, "wb") as f:
         f.write(downloaded_file)
 
-      expert_text = PHOTO_ANALYSIS_TEMPLATES.get(
-          category_key,
-          f"{category['label']}\n\nАнализ выполнен на основе общих"
-          " экспертных принципов данной категории.",
+      hosted_url = upload_temp_image(input_path, expire="1h")
+
+      prompt_text = (
+          f"Сделай детальный, уникальный и развернутый разбор в категории '{category['label']}'."
+          f" Опиши сильные стороны, слабые места и дай 2-3 конкретных совета по улучшению."
+          f" Ссылка на изображение для контекста: {hosted_url}. "
+          f"Напиши профессионально, честно, без воды, строго на русском языке."
       )
+
+      completion = groq_client.chat.completions.create(
+          messages=[
+              {"role": "system", "content": category["system"]},
+              {"role": "user", "content": prompt_text},
+          ],
+          model=GROQ_MODEL,
+      )
+      expert_text = completion.choices[0].message.content.strip()
+      expert_text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", expert_text)
+
+      formatted_output = f"📊 <b>GOAT Анализ: {category['label']}</b>\n\n{expert_text}"
 
       leveled_up, new_level, coins, xp = add_xp(
           user_id, message.from_user.first_name or "друг", 20
@@ -1660,7 +1643,7 @@ def handle_photo(message):
       )
       bot.send_message(
           chat_id,
-          expert_text + "\n\n<i>+20 XP</i>",
+          formatted_output + "\n\n<i>+20 XP</i>",
           reply_markup=markup,
           parse_mode="HTML",
       )
@@ -1740,7 +1723,7 @@ def handle_photo(message):
 
 
 # ================================================================
-# 16. ОБЫЧНЫЕ ТЕКСТОВЫЕ СООБЩЕНИЯ — GOAT CHAT
+# 16. ТЕКСТОВЫЕ СООБЩЕНИЯ (GOAT Chat)
 # ================================================================
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
