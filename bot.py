@@ -134,32 +134,50 @@ import io
 
 def analyze_photo_with_ai(image_path, system_prompt):
   """Отправляет фото в vision-модель Groq и возвращает реальный разбор
-  именно этого изображения (а не заготовленный текст)."""
+  именно этого изображения (а не заготовленный текст).
+
+  Используем сырой HTTP-запрос к Groq (а не SDK), чтобы не зависеть от
+  версии установленного пакета groq на сервере — так надёжнее."""
   with open(image_path, "rb") as f:
     b64_image = base64.b64encode(f.read()).decode("utf-8")
 
-  completion = groq_client.chat.completions.create(
-      model=GROQ_VISION_MODEL,
-      messages=[
-          {"role": "system", "content": system_prompt},
-          {
-              "role": "user",
-              "content": [
-                  {
-                      "type": "text",
-                      "text": "Проанализируй это изображение согласно своей роли.",
-                  },
-                  {
-                      "type": "image_url",
-                      "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
-                  },
-              ],
-          },
-      ],
-      temperature=0.7,
-      max_completion_tokens=800,
+  resp = requests.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      headers={
+          "Authorization": f"Bearer {groq_api_key}",
+          "Content-Type": "application/json",
+      },
+      json={
+          "model": GROQ_VISION_MODEL,
+          "messages": [
+              {"role": "system", "content": system_prompt},
+              {
+                  "role": "user",
+                  "content": [
+                      {
+                          "type": "text",
+                          "text": "Проанализируй это изображение согласно своей роли.",
+                      },
+                      {
+                          "type": "image_url",
+                          "image_url": {
+                              "url": f"data:image/jpeg;base64,{b64_image}"
+                          },
+                      },
+                  ],
+              },
+          ],
+          "temperature": 0.7,
+          "max_completion_tokens": 800,
+      },
+      timeout=60,
   )
-  return completion.choices[0].message.content.strip()
+  if resp.status_code != 200:
+    raise ValueError(
+        f"Groq vision API вернул {resp.status_code}: {resp.text[:300]}"
+    )
+  data = resp.json()
+  return data["choices"][0]["message"]["content"].strip()
 
 
 def fetch_pollinations_image(url, timeout=120, retries=2):
@@ -214,12 +232,27 @@ if not groq_api_key:
   print("⚠️ Предупреждение: GROQ_API_KEY не найден в Secrets!")
 
 groq_client = Groq(api_key=groq_api_key)
-GROQ_MODEL = "openai/gpt-oss-120b"  # llama-3.3-70b-versatile отключается 16.08.26
+GROQ_MODEL = "llama-3.3-70b-versatile"  # ⚠️ отключается 16.08.26, нужна миграция
 GROQ_VISION_MODEL = "qwen/qwen3.6-27b"  # модель с поддержкой изображений
 
 CHANNEL_ID = "@goatai_news"
 CHANNEL_URL = "https://t.me/goatai_news"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+
+
+def notify_admin_error(context, error_text):
+  """Присылает админу техническую деталь ошибки в Telegram, чтобы не лезть
+  в серверные логи для диагностики."""
+  if not ADMIN_ID:
+    return
+  try:
+    bot.send_message(
+        ADMIN_ID,
+        f"⚠️ <b>Ошибка [{context}]</b>\n<code>{str(error_text)[:900]}</code>",
+        parse_mode="HTML",
+    )
+  except Exception as notify_err:
+    print(f"Не удалось уведомить админа об ошибке: {notify_err}")
 
 user_modes = {}      # chat_id -> ключ роли GOAT Chat (в памяти, для скорости)
 game_sessions = {}   # user_id -> состояние текущей игры
@@ -318,13 +351,17 @@ ROLES = {
             "Ты — дерзкий, прямолинейный персонаж без фильтров, реально"
             " материшься в речи — используешь русский мат свободно, в"
             " каждом сообщении, как обычную часть своей речи, а не редкую"
-            " приправу. Общаешься с пользователем на «ты», грубо, с"
-            " сарказмом и чёрным юмором. При этом ты всё равно по существу"
-            " отвечаешь на вопрос пользователя — просто делаешь это"
-            " матерно и без обиняков. Не оскорбляешь пользователя лично и"
-            " не переходишь на темы дискриминации — мат используешь как"
-            " экспрессию речи (междометия, усилители, связки), а не как"
-            " оскорбления в адрес человека. Пиши строго на русском языке."
+            " приправу. Пиши матерные слова ПОЛНОСТЬЮ, без звёздочек и"
+            " пропущенных букв (например «нахуй», а не «на х*й» или"
+            " «*нах*») — цензурить самого себя нельзя. Общаешься с"
+            " пользователем на «ты», грубо, с сарказмом и чёрным юмором."
+            " При этом ты всегда чётко и по существу отвечаешь на вопрос"
+            " пользователя — коротко, ясно, без воды и путаных оборотов,"
+            " просто делаешь это матерно и без обиняков. Не оскорбляешь"
+            " пользователя лично и не переходишь на темы дискриминации —"
+            " мат используешь как экспрессию речи (междометия, усилители,"
+            " связки), а не как оскорбления в адрес человека. Пиши строго"
+            " на русском языке."
         ),
     },
 }
@@ -1431,13 +1468,20 @@ def translate_to_english(text):
   return completion.choices[0].message.content.strip()
 
 
+_UPLOAD_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
 def _upload_to_litterbox(file_path, expire="1h"):
   with open(file_path, "rb") as f:
     resp = requests.post(
         "https://litterbox.catbox.moe/resources/internals/api.php",
         data={"reqtype": "fileupload", "time": expire},
         files={"fileToUpload": f},
-        timeout=30,
+        headers={"User-Agent": _UPLOAD_UA},
+        timeout=45,
     )
   if resp.status_code == 200 and resp.text.strip().startswith("http"):
     return resp.text.strip()
@@ -1449,12 +1493,26 @@ def _upload_to_0x0(file_path):
     resp = requests.post(
         "https://0x0.st",
         files={"file": f},
-        headers={"User-Agent": "GOAT-AI-Bot/1.0"},
-        timeout=30,
+        headers={"User-Agent": _UPLOAD_UA},
+        timeout=45,
     )
   if resp.status_code == 200 and resp.text.strip().startswith("http"):
     return resp.text.strip()
   raise ValueError(f"0x0.st вернул неожиданный ответ: {resp.text[:200]}")
+
+
+def _upload_to_catbox(file_path):
+  with open(file_path, "rb") as f:
+    resp = requests.post(
+        "https://catbox.moe/user/api.php",
+        data={"reqtype": "fileupload"},
+        files={"fileToUpload": f},
+        headers={"User-Agent": _UPLOAD_UA},
+        timeout=45,
+    )
+  if resp.status_code == 200 and resp.text.strip().startswith("http"):
+    return resp.text.strip()
+  raise ValueError(f"Catbox вернул неожиданный ответ: {resp.text[:200]}")
 
 
 def upload_temp_image(file_path, expire="1h"):
@@ -1464,19 +1522,26 @@ def upload_temp_image(file_path, expire="1h"):
   img2img, чтобы не передавать во внешний сервис постоянную ссылку или токен
   бота). Каждый хостинг пробуется дважды на случай кратковременного сбоя,
   затем идёт переключение на следующий — так один нестабильный сервис не
-  роняет всю функцию."""
+  роняет всю функцию.
+
+  Возвращает (url, errors) — при полном провале url будет None, а errors —
+  список текстов ошибок от каждого хостинга, чтобы можно было сообщить
+  реальную причину, а не просто "не сработало"."""
   uploaders = [
       ("Litterbox", lambda: _upload_to_litterbox(file_path, expire)),
       ("0x0.st", lambda: _upload_to_0x0(file_path)),
+      ("Catbox", lambda: _upload_to_catbox(file_path)),
   ]
+  errors = []
   for name, uploader in uploaders:
     for attempt in range(2):
       try:
-        return uploader()
+        return uploader(), errors
       except Exception as e:
-        print(f"Ошибка загрузки временного фото через {name} (попытка"
-              f" {attempt + 1}/2): {e}")
-  return None
+        msg = f"{name} (попытка {attempt + 1}/2): {e}"
+        print(f"Ошибка загрузки временного фото через {msg}")
+        errors.append(msg)
+  return None, errors
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "ask_draw")
@@ -1605,13 +1670,14 @@ def process_edit_prompt(message, source_photo_path):
   bot.send_chat_action(chat_id, "upload_photo")
 
   try:
-    hosted_url = upload_temp_image(source_photo_path, expire="1h")
+    hosted_url, upload_errors = upload_temp_image(source_photo_path, expire="1h")
     if not hosted_url:
       bot.send_message(
           chat_id,
           "❌ Не удалось загрузить фото для обработки — временный хостинг"
           " сейчас недоступен. Подождите немного и попробуйте ещё раз.",
       )
+      notify_admin_error("загрузка фото на хостинг", "\n".join(upload_errors))
       return
 
     english_prompt = translate_to_english(prompt)
@@ -1650,6 +1716,7 @@ def process_edit_prompt(message, source_photo_path):
   except Exception as e:
     print(f"Ошибка редактирования изображения: {e}")
     bot.send_message(chat_id, "❌ Не удалось изменить фото.")
+    notify_admin_error("редактирование фото", e)
   finally:
     if os.path.exists(source_photo_path):
       os.remove(source_photo_path)
@@ -1732,7 +1799,11 @@ def handle_photo(message):
         send_level_up_message(chat_id, new_level, coins)
     except Exception as e:
       print(f"Ошибка анализа фото: {e}")
-      bot.send_message(chat_id, "❌ Ошибка при анализе фото.")
+      bot.send_message(
+          chat_id,
+          "❌ Ошибка при анализе фото. Попробуйте другое фото или чуть позже.",
+      )
+      notify_admin_error("GOAT анализ фото", e)
     finally:
       if os.path.exists(input_path):
         os.remove(input_path)
