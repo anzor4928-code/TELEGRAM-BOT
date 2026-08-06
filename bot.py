@@ -780,15 +780,21 @@ def send_welcome(message):
 def send_main_menu(chat_id, user_name):
   markup = types.InlineKeyboardMarkup(row_width=1)
   markup.add(
+      types.InlineKeyboardButton(
+          "🎮 Игра «Правда или Ложь»", callback_data="start_chat_game"
+      ),
       types.InlineKeyboardButton("🐐 GOAT Chat", callback_data="goat_chat"),
       types.InlineKeyboardButton("🔍 GOAT Анализ", callback_data="goat_analysis"),
       types.InlineKeyboardButton("🎨 Генерация", callback_data="ask_draw"),
       types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+      types.InlineKeyboardButton("🏆 Лидеры", callback_data="show_leaderboard"),
       types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
   )
 
   welcome_text = (
-      f"🐐 <b>GOAT AI</b>\nДобро пожаловать, {user_name}!\n\nВыберите раздел:"
+      f"🐐 <b>GOAT AI</b>\nДобро пожаловать, {user_name}!\n\n🎮 Не забудьте"
+      " попробовать игру «Правда или Ложь» — испытайте себя и заработайте"
+      " очки!\n\nВыберите раздел:"
   )
   bot.send_message(chat_id, welcome_text, reply_markup=markup, parse_mode="HTML")
 
