@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import re
@@ -9,7 +10,7 @@ import requests
 import telebot
 from flask import Flask
 from groq import Groq
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 from telebot import types
 
 # ================================================================
@@ -132,54 +133,6 @@ import base64
 import io
 
 
-def analyze_photo_with_ai(image_path, system_prompt):
-  """Отправляет фото в vision-модель Groq и возвращает реальный разбор
-  именно этого изображения (а не заготовленный текст).
-
-  Используем сырой HTTP-запрос к Groq (а не SDK), чтобы не зависеть от
-  версии установленного пакета groq на сервере — так надёжнее."""
-  with open(image_path, "rb") as f:
-    b64_image = base64.b64encode(f.read()).decode("utf-8")
-
-  resp = requests.post(
-      "https://api.groq.com/openai/v1/chat/completions",
-      headers={
-          "Authorization": f"Bearer {groq_api_key}",
-          "Content-Type": "application/json",
-      },
-      json={
-          "model": GROQ_VISION_MODEL,
-          "messages": [
-              {"role": "system", "content": system_prompt},
-              {
-                  "role": "user",
-                  "content": [
-                      {
-                          "type": "text",
-                          "text": "Проанализируй это изображение согласно своей роли.",
-                      },
-                      {
-                          "type": "image_url",
-                          "image_url": {
-                              "url": f"data:image/jpeg;base64,{b64_image}"
-                          },
-                      },
-                  ],
-              },
-          ],
-          "temperature": 0.7,
-          "max_completion_tokens": 800,
-      },
-      timeout=60,
-  )
-  if resp.status_code != 200:
-    raise ValueError(
-        f"Groq vision API вернул {resp.status_code}: {resp.text[:300]}"
-    )
-  data = resp.json()
-  return data["choices"][0]["message"]["content"].strip()
-
-
 def fetch_pollinations_image(url, timeout=120, retries=2):
   """Скачивает сгенерированное изображение с Pollinations сами, а не отдаём
   ссылку напрямую в Telegram. Генерация (особенно img2img/kontext) может
@@ -233,7 +186,6 @@ if not groq_api_key:
 
 groq_client = Groq(api_key=groq_api_key)
 GROQ_MODEL = "llama-3.3-70b-versatile"  # ⚠️ отключается 16.08.26, нужна миграция
-GROQ_VISION_MODEL = "qwen/qwen3.6-27b"  # модель с поддержкой изображений
 
 CHANNEL_ID = "@goatai_news"
 CHANNEL_URL = "https://t.me/goatai_news"
@@ -268,8 +220,15 @@ HONESTY_RULE = (
     " Только аргументы и конкретные, применимые советы. Пиши строго на"
     " русском языке. Отвечай простыми словами, без сложных терминов и"
     " профессионального жаргона — как будто объясняешь другу. Формат: 3-4"
-    " коротких пункта, без воды. Пиши предметно именно про то, что видишь"
-    " на этом конкретном фото или в этом тексте, а не общими фразами."
+    " коротких пункта, без воды. Пиши предметно именно про то, что тебе"
+    " прислали, а не общими фразами."
+)
+
+ANALYST_SYSTEM_PROMPT = (
+    "Ты — универсальный аналитик GOAT. Тебе присылают что угодно: бизнес-"
+    "идею, текст, кусок кода, план, вопрос, описание ситуации — и что бы"
+    " это ни было, ты сам определяешь, о чём речь, и даёшь по этому честный,"
+    " предметный разбор. " + HONESTY_RULE
 )
 
 # ================================================================
@@ -352,98 +311,28 @@ ROLES = {
             " материшься в речи — используешь русский мат свободно, в"
             " каждом сообщении, как обычную часть своей речи, а не редкую"
             " приправу. Пиши матерные слова ПОЛНОСТЬЮ, без звёздочек и"
-            " пропущенных букв (например «нахуй», а не «на х*й» или"
-            " «*нах*») — цензурить самого себя нельзя. Общаешься с"
-            " пользователем на «ты», грубо, с сарказмом и чёрным юмором."
-            " При этом ты всегда чётко и по существу отвечаешь на вопрос"
-            " пользователя — коротко, ясно, без воды и путаных оборотов,"
-            " просто делаешь это матерно и без обиняков. Не оскорбляешь"
-            " пользователя лично и не переходишь на темы дискриминации —"
-            " мат используешь как экспрессию речи (междометия, усилители,"
-            " связки), а не как оскорбления в адрес человека. Пиши строго"
-            " на русском языке."
+            " пропущенных букв — цензурить самого себя нельзя. Используй"
+            " РАЗНООБРАЗНЫЙ мат, не повторяй одно и то же слово в каждом"
+            " сообщении: чередуй разные корни и формы (блять, сука, хуй,"
+            " пиздец, ебать, нахуй, ёбаный, охуеть, заебал и т.п. — по"
+            " ситуации и смыслу), как это делает живой человек, а не"
+            " зацикливайся на одном-двух словах. Общаешься с пользователем"
+            " на «ты», грубо, с сарказмом и чёрным юмором. При этом ты"
+            " всегда чётко и по существу отвечаешь на вопрос пользователя —"
+            " коротко, ясно, без воды и путаных оборотов, просто делаешь"
+            " это матерно и без обиняков. Не оскорбляешь пользователя лично"
+            " и не переходишь на темы дискриминации — мат используешь как"
+            " экспрессию речи (междометия, усилители, связки), а не как"
+            " оскорбления в адрес человека. Пиши строго на русском языке."
         ),
     },
 }
 DEFAULT_ROLE_KEY = "assistant"
 
 # ================================================================
-# 5. GOAT АНАЛИЗ — категории
+# 5. GOAT АНАЛИЗ — единый режим "Аналитик" (без категорий и кнопок)
 # ================================================================
-ANALYSIS_CATEGORIES = {
-    "appearance": {
-        "label": "👤 Внешность",
-        "type": "photo",
-        "system": (
-            "Ты — дружелюбный стилист. Простыми словами говоришь, идёт ли"
-            " человеку то, что на нём надето, сочетается ли по цвету и"
-            " стилю, и что можно было бы поменять. " + HONESTY_RULE
-        ),
-    },
-    "photo": {
-        "label": "📷 Фото",
-        "type": "photo",
-        "system": (
-            "Ты — фотограф-друг. Простыми словами говоришь, удачный ли"
-            " кадр: получилось интересно или скучно, что в кадре мешает,"
-            " а что цепляет взгляд. " + HONESTY_RULE
-        ),
-    },
-    "design": {
-        "label": "🎨 Дизайн",
-        "type": "photo",
-        "system": (
-            "Ты — дизайнер-практик. Простыми словами говоришь, удобно ли"
-            " смотрится макет, не перегружен ли он, читается ли главное"
-            " с первого взгляда. " + HONESTY_RULE
-        ),
-    },
-    "text": {
-        "label": "📝 Текст",
-        "type": "text",
-        "system": (
-            "Ты — редактор-практик. Простыми словами говоришь, легко ли"
-            " читается текст, где лишние слова, где мысль потерялась."
-            " " + HONESTY_RULE
-        ),
-    },
-    "idea": {
-        "label": "💡 Идея",
-        "type": "text",
-        "system": (
-            "Ты — предприниматель-практик. Простыми словами говоришь, есть"
-            " ли в идее смысл, что в ней слабое место и что стоит"
-            " проверить в первую очередь. " + HONESTY_RULE
-        ),
-    },
-    "code": {
-        "label": "💻 Код",
-        "type": "text",
-        "system": (
-            "Ты — опытный разработчик. Простыми словами говоришь, что не"
-            " так в коде, где может быть баг и как это поправить."
-            " " + HONESTY_RULE
-        ),
-    },
-    "interface": {
-        "label": "📱 Интерфейс",
-        "type": "photo",
-        "system": (
-            "Ты — практик по интерфейсам. Простыми словами говоришь,"
-            " удобно ли пользоваться этим экраном, не запутается ли"
-            " человек, что не сразу понятно. " + HONESTY_RULE
-        ),
-    },
-    "business": {
-        "label": "📈 Бизнес",
-        "type": "text",
-        "system": (
-            "Ты — практичный бизнес-советчик. Простыми словами говоришь,"
-            " что сильное, а что слабое в описанном деле, и что делать"
-            " дальше. " + HONESTY_RULE
-        ),
-    },
-}
+# см. ANALYST_SYSTEM_PROMPT выше
 
 
 # ================================================================
@@ -980,64 +869,29 @@ def cb_set_mode(call):
 
 
 # ================================================================
-# 10. GOAT АНАЛИЗ
+# 10. GOAT АНАЛИЗ — единый режим, без кнопок-категорий
 # ================================================================
 @bot.callback_query_handler(func=lambda call: call.data == "goat_analysis")
 def cb_goat_analysis(call):
   bot.answer_callback_query(call.id)
-  markup = types.InlineKeyboardMarkup(row_width=2)
-  buttons = [
-      types.InlineKeyboardButton(cat["label"], callback_data=f"analysis_{key}")
-      for key, cat in ANALYSIS_CATEGORIES.items()
-  ]
-  markup.add(*buttons)
-  markup.add(
-      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
-  )
-  text = (
-      "🔍 <b>GOAT Анализ</b>\nВыберите, что разобрать.\n\n<i>GOAT Анализ"
-      " всегда честный — без лести и без грубости, только аргументы и"
-      " советы.</i>"
-  )
-  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("analysis_"))
-def cb_analysis_category(call):
-  bot.answer_callback_query(call.id)
-  key = call.data.replace("analysis_", "")
-  category = ANALYSIS_CATEGORIES.get(key)
-  if not category:
-    return
-
-  user_id = call.from_user.id
   markup = types.InlineKeyboardMarkup()
   markup.add(
       types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
   )
-
-  if category["type"] == "photo":
-    user_states[user_id] = f"waiting_analysis:{key}"
-    bot.send_message(
-        call.message.chat.id,
-        f"{category['label']}\n\n📸 Пришлите фотографию для анализа.",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
-  else:
-    msg = bot.send_message(
-        call.message.chat.id,
-        f"{category['label']}\n\n📝 Пришлите текст для анализа одним"
-        " сообщением.",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
-    bot.register_next_step_handler(
-        msg, lambda m, k=key: process_text_analysis(m, k)
-    )
+  text = (
+      "🔍 <b>GOAT Анализ</b>\nПросто опишите словами, что нужно разобрать —"
+      " бизнес-идею, текст, код, план, что угодно. Например: «оцени идею"
+      " для бизнеса — доставка обедов в офисы» или «разбери этот текст:"
+      " ...».\n\n<i>Всегда честно — без лести и без грубости, только"
+      " аргументы и советы.</i>"
+  )
+  msg = bot.send_message(
+      call.message.chat.id, text, reply_markup=markup, parse_mode="HTML"
+  )
+  bot.register_next_step_handler(msg, process_analysis)
 
 
-def process_text_analysis(message, category_key):
+def process_analysis(message):
   user_id = message.from_user.id
   if not require_subscription(message.chat.id, user_id):
     return
@@ -1047,7 +901,6 @@ def process_text_analysis(message, category_key):
     bot.send_message(message.chat.id, "❌ Анализ отменен.")
     return
 
-  category = ANALYSIS_CATEGORIES[category_key]
   bot.send_chat_action(message.chat.id, "typing")
 
   if not groq_api_key:
@@ -1057,7 +910,7 @@ def process_text_analysis(message, category_key):
   try:
     completion = groq_client.chat.completions.create(
         messages=[
-            {"role": "system", "content": category["system"]},
+            {"role": "system", "content": ANALYST_SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ],
         model=GROQ_MODEL,
@@ -1075,14 +928,15 @@ def process_text_analysis(message, category_key):
             "🏠 Главное меню", callback_data="back_to_menu"
         )
     )
-    text = f"{category['label']}\n\n{answer}\n\n<i>+20 XP</i>"
+    text = f"🔍 <b>Анализ</b>\n\n{answer}\n\n<i>+20 XP</i>"
     bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
 
     if leveled_up:
       send_level_up_message(message.chat.id, new_level, coins)
   except Exception as e:
-    print(f"Ошибка Groq API (анализ текста): {e}")
+    print(f"Ошибка Groq API (анализ): {e}")
     bot.send_message(message.chat.id, "❌ Не удалось выполнить анализ.")
+    notify_admin_error("GOAT анализ", e)
 
 
 def send_level_up_message(chat_id, new_level, coins):
@@ -1468,89 +1322,13 @@ def translate_to_english(text):
   return completion.choices[0].message.content.strip()
 
 
-_UPLOAD_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-def _upload_to_litterbox(file_path, expire="1h"):
-  with open(file_path, "rb") as f:
-    resp = requests.post(
-        "https://litterbox.catbox.moe/resources/internals/api.php",
-        data={"reqtype": "fileupload", "time": expire},
-        files={"fileToUpload": f},
-        headers={"User-Agent": _UPLOAD_UA},
-        timeout=45,
-    )
-  if resp.status_code == 200 and resp.text.strip().startswith("http"):
-    return resp.text.strip()
-  raise ValueError(f"Litterbox вернул неожиданный ответ: {resp.text[:200]}")
-
-
-def _upload_to_0x0(file_path):
-  with open(file_path, "rb") as f:
-    resp = requests.post(
-        "https://0x0.st",
-        files={"file": f},
-        headers={"User-Agent": _UPLOAD_UA},
-        timeout=45,
-    )
-  if resp.status_code == 200 and resp.text.strip().startswith("http"):
-    return resp.text.strip()
-  raise ValueError(f"0x0.st вернул неожиданный ответ: {resp.text[:200]}")
-
-
-def _upload_to_catbox(file_path):
-  with open(file_path, "rb") as f:
-    resp = requests.post(
-        "https://catbox.moe/user/api.php",
-        data={"reqtype": "fileupload"},
-        files={"fileToUpload": f},
-        headers={"User-Agent": _UPLOAD_UA},
-        timeout=45,
-    )
-  if resp.status_code == 200 and resp.text.strip().startswith("http"):
-    return resp.text.strip()
-  raise ValueError(f"Catbox вернул неожиданный ответ: {resp.text[:200]}")
-
-
-def upload_temp_image(file_path, expire="1h"):
-  """Загружает файл на анонимный временный хостинг и возвращает публичный URL.
-
-  Пробует несколько бесплатных хостингов без регистрации (используем для
-  img2img, чтобы не передавать во внешний сервис постоянную ссылку или токен
-  бота). Каждый хостинг пробуется дважды на случай кратковременного сбоя,
-  затем идёт переключение на следующий — так один нестабильный сервис не
-  роняет всю функцию.
-
-  Возвращает (url, errors) — при полном провале url будет None, а errors —
-  список текстов ошибок от каждого хостинга, чтобы можно было сообщить
-  реальную причину, а не просто "не сработало"."""
-  uploaders = [
-      ("Litterbox", lambda: _upload_to_litterbox(file_path, expire)),
-      ("0x0.st", lambda: _upload_to_0x0(file_path)),
-      ("Catbox", lambda: _upload_to_catbox(file_path)),
-  ]
-  errors = []
-  for name, uploader in uploaders:
-    for attempt in range(2):
-      try:
-        return uploader(), errors
-      except Exception as e:
-        msg = f"{name} (попытка {attempt + 1}/2): {e}"
-        print(f"Ошибка загрузки временного фото через {msg}")
-        errors.append(msg)
-  return None, errors
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "ask_draw")
 def cb_ask_draw(call):
   bot.answer_callback_query(call.id)
   markup = types.InlineKeyboardMarkup(row_width=1)
   markup.add(
       types.InlineKeyboardButton("✨ Сгенерировать с нуля", callback_data="gen_new"),
-      types.InlineKeyboardButton("🖌 Изменить моё фото", callback_data="gen_edit"),
+      types.InlineKeyboardButton("😂 Мем с надписью", callback_data="gen_meme"),
       types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
   )
   bot.send_message(
@@ -1629,68 +1407,98 @@ def process_image_prompt(message):
     bot.send_message(message.chat.id, "❌ Не удалось сгенерировать изображение.")
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "gen_edit")
-def cb_gen_edit(call):
+@bot.callback_query_handler(func=lambda call: call.data == "gen_meme")
+def cb_gen_meme(call):
   bot.answer_callback_query(call.id)
   user_id = call.from_user.id
   if not require_subscription(call.message.chat.id, user_id):
     return
-  user_states[user_id] = "waiting_edit_photo"
   markup = types.InlineKeyboardMarkup()
   markup.add(
       types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
   )
-  bot.send_message(
+  msg = bot.send_message(
       call.message.chat.id,
-      "🖌 <b>Изменить фото</b>\n\n📸 Пришлите фотографию, которую нужно"
-      " изменить.",
+      "😂 <b>Мем с надписью</b>\n\nОпишите идею одним сообщением — какая"
+      " картинка и что должно быть написано. Например: «кот в костюме"
+      " директора, надпись сверху: ПОНЕДЕЛЬНИК, снизу: СНОВА НА РАБОТУ».",
       reply_markup=markup,
       parse_mode="HTML",
   )
+  bot.register_next_step_handler(msg, process_meme_prompt)
 
 
-def process_edit_prompt(message, source_photo_path):
+def _load_meme_font(size):
+  try:
+    return ImageFont.load_default(size=size)
+  except TypeError:
+    # Старые версии Pillow не поддерживают size у load_default()
+    return ImageFont.load_default()
+
+
+def _draw_meme_caption(draw, text, img_width, y, font_size):
+  if not text:
+    return
+  font = _load_meme_font(font_size)
+  text = text.upper()
+  bbox = draw.textbbox((0, 0), text, font=font, stroke_width=3)
+  text_w = bbox[2] - bbox[0]
+  x = max((img_width - text_w) // 2, 10)
+  draw.text(
+      (x, y), text, font=font, fill="white", stroke_width=3, stroke_fill="black"
+  )
+
+
+def process_meme_prompt(message):
   user_id = message.from_user.id
   chat_id = message.chat.id
   if not require_subscription(chat_id, user_id):
-    if os.path.exists(source_photo_path):
-      os.remove(source_photo_path)
     return
 
-  prompt = (message.text or "").strip()
-  if not prompt or prompt.startswith("/"):
-    bot.send_message(chat_id, "❌ Изменение отменено.")
-    if os.path.exists(source_photo_path):
-      os.remove(source_photo_path)
+  idea = (message.text or "").strip()
+  if not idea or idea.startswith("/"):
+    bot.send_message(chat_id, "❌ Создание мема отменено.")
     return
 
   status_msg = bot.send_message(
-      chat_id, "🖌 <b>Изменяю фото...</b>", parse_mode="HTML"
+      chat_id, "😂 <b>Придумываю мем...</b>", parse_mode="HTML"
   )
   bot.send_chat_action(chat_id, "upload_photo")
 
   try:
-    hosted_url, upload_errors = upload_temp_image(source_photo_path, expire="1h")
-    if not hosted_url:
-      bot.send_message(
-          chat_id,
-          "❌ Не удалось загрузить фото для обработки — временный хостинг"
-          " сейчас недоступен. Подождите немного и попробуйте ещё раз.",
-      )
-      notify_admin_error("загрузка фото на хостинг", "\n".join(upload_errors))
-      return
+    meme_plan_raw = groq_client.chat.completions.create(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты помощник для генерации мемов. По идее пользователя"
+                    " верни СТРОГО один JSON-объект, без markdown и"
+                    " пояснений: {\"scene\": короткое описание картинки на"
+                    " английском для генератора изображений, \"top_text\":"
+                    " короткая надпись сверху на русском капсом (до 40"
+                    " символов, можно пустую строку), \"bottom_text\":"
+                    " короткая надпись снизу на русском капсом (до 40"
+                    " символов, можно пустую строку)}."
+                ),
+            },
+            {"role": "user", "content": idea},
+        ],
+        model=GROQ_MODEL,
+    ).choices[0].message.content.strip()
 
-    english_prompt = translate_to_english(prompt)
-    encoded_prompt = urllib.parse.quote(english_prompt)
-    encoded_image_url = urllib.parse.quote(hosted_url, safe="")
+    meme_plan_raw = re.sub(r"^```json|```$", "", meme_plan_raw.strip()).strip()
+    meme_plan = json.loads(meme_plan_raw)
+    scene = meme_plan.get("scene") or idea
+    top_text = (meme_plan.get("top_text") or "").strip()
+    bottom_text = (meme_plan.get("bottom_text") or "").strip()
 
-    edit_url = (
-        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-        f"?model=kontext&image={encoded_image_url}"
-        f"&width=1024&height=1024&nologo=true"
+    seed = random.randint(1, 1000000)
+    encoded_scene = urllib.parse.quote(scene)
+    image_url = (
+        f"https://image.pollinations.ai/prompt/{encoded_scene}"
+        f"?model=flux&width=1024&height=1024&nologo=true&seed={seed}"
     )
-
-    image_bytes = fetch_pollinations_image(edit_url)
+    image_bytes = fetch_pollinations_image(image_url)
     if not image_bytes:
       bot.send_message(
           chat_id,
@@ -1700,12 +1508,22 @@ def process_edit_prompt(message, source_photo_path):
       bot.delete_message(chat_id, status_msg.message_id)
       return
 
-    bot.send_photo(
-        chat_id,
-        io.BytesIO(image_bytes),
-        caption=f"🖌 <b>Изменено:</b> {prompt}",
-        parse_mode="HTML",
-    )
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font_size = max(img.width // 12, 32)
+    _draw_meme_caption(draw, top_text, img.width, 15, font_size)
+    if bottom_text:
+      bbox = draw.textbbox((0, 0), bottom_text.upper(), stroke_width=3)
+      text_h = bbox[3] - bbox[1]
+      _draw_meme_caption(
+          draw, bottom_text, img.width, img.height - text_h - 25, font_size
+      )
+
+    output = io.BytesIO()
+    img.save(output, format="JPEG", quality=92)
+    output.seek(0)
+
+    bot.send_photo(chat_id, output, caption="😂 <b>Ваш мем</b>", parse_mode="HTML")
     bot.delete_message(chat_id, status_msg.message_id)
 
     leveled_up, new_level, coins, xp = add_xp(
@@ -1714,12 +1532,9 @@ def process_edit_prompt(message, source_photo_path):
     if leveled_up:
       send_level_up_message(chat_id, new_level, coins)
   except Exception as e:
-    print(f"Ошибка редактирования изображения: {e}")
-    bot.send_message(chat_id, "❌ Не удалось изменить фото.")
-    notify_admin_error("редактирование фото", e)
-  finally:
-    if os.path.exists(source_photo_path):
-      os.remove(source_photo_path)
+    print(f"Ошибка создания мема: {e}")
+    bot.send_message(chat_id, "❌ Не удалось создать мем. Попробуйте ещё раз.")
+    notify_admin_error("генерация мема", e)
 
 
 # ================================================================
@@ -1736,77 +1551,10 @@ def handle_photo(message):
 
   state = user_states.get(user_id, "")
 
-  if state == "waiting_edit_photo":
-    user_states.pop(user_id, None)
-    try:
-      file_info = bot.get_file(message.photo[-1].file_id)
-      downloaded_file = bot.download_file(file_info.file_path)
-      edit_source_path = f"edit_source_{user_id}.jpg"
-      with open(edit_source_path, "wb") as f:
-        f.write(downloaded_file)
-    except Exception as e:
-      print(f"Ошибка загрузки фото для редактирования: {e}")
-      bot.send_message(chat_id, "❌ Не удалось загрузить фото.")
-      return
-
-    msg = bot.send_message(
-        chat_id,
-        "📝 Опишите, что изменить на фото (например: «сделай в стиле"
-        " акварели» или «добавь снег»):",
-    )
-    bot.register_next_step_handler(
-        msg, lambda m, p=edit_source_path: process_edit_prompt(m, p)
-    )
-    return
-
   if state.startswith("waiting_analysis:"):
-    category_key = state.split(":", 1)[1]
-    category = ANALYSIS_CATEGORIES.get(category_key)
+    # legacy-состояние из старой версии бота (фото-анализ убран) — просто
+    # сбрасываем, чтобы пользователь не завис в старом режиме.
     user_states.pop(user_id, None)
-    if not category:
-      return
-
-    processing_msg = bot.send_message(
-        chat_id, f"🔍 <b>{category['label']}: анализирую...</b>", parse_mode="HTML"
-    )
-    try:
-      file_info = bot.get_file(message.photo[-1].file_id)
-      downloaded_file = bot.download_file(file_info.file_path)
-      with open(input_path, "wb") as f:
-        f.write(downloaded_file)
-
-      expert_text = analyze_photo_with_ai(input_path, category["system"])
-
-      leveled_up, new_level, coins, xp = add_xp(
-          user_id, message.from_user.first_name or "друг", 20
-      )
-
-      markup = types.InlineKeyboardMarkup()
-      markup.add(
-          types.InlineKeyboardButton(
-              "🏠 Главное меню", callback_data="back_to_menu"
-          )
-      )
-      bot.send_message(
-          chat_id,
-          expert_text + "\n\n<i>+20 XP</i>",
-          reply_markup=markup,
-          parse_mode="HTML",
-      )
-      bot.delete_message(chat_id, processing_msg.message_id)
-
-      if leveled_up:
-        send_level_up_message(chat_id, new_level, coins)
-    except Exception as e:
-      print(f"Ошибка анализа фото: {e}")
-      bot.send_message(
-          chat_id,
-          "❌ Ошибка при анализе фото. Попробуйте другое фото или чуть позже.",
-      )
-      notify_admin_error("GOAT анализ фото", e)
-    finally:
-      if os.path.exists(input_path):
-        os.remove(input_path)
     return
 
   if any(k in caption for k in ["/bg", "фон", "удалить фон"]):
