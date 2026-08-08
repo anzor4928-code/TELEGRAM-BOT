@@ -1,9 +1,12 @@
+import functools
+import html
 import json
 import os
 import random
 import re
 import sqlite3
 import threading
+import time
 import urllib.parse
 
 import requests
@@ -20,6 +23,17 @@ from telebot import types
 DB_PATH = os.environ.get("DB_PATH", "leaderboard.db")
 
 
+def db_connect():
+  """Единая точка подключения к SQLite: WAL-режим (меньше блокировок при
+  параллельных запросах из Flask+polling-потоков) и busy_timeout, чтобы
+  временная блокировка "database is locked" не роняла обработчик, а просто
+  подождала и повторила попытку сама на уровне SQLite."""
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+  conn.execute("PRAGMA journal_mode=WAL")
+  conn.execute("PRAGMA busy_timeout=8000")
+  return conn
+
+
 def _add_column_if_missing(cursor, table, column, coltype):
   try:
     cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
@@ -28,7 +42,7 @@ def _add_column_if_missing(cursor, table, column, coltype):
 
 
 def init_db():
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute("""
         CREATE TABLE IF NOT EXISTS scores (
@@ -54,6 +68,17 @@ def init_db():
   _add_column_if_missing(
       cursor, "scores", "best_guess_questions", "INTEGER DEFAULT 0"
   )
+  # Персонажи, которых бот не смог угадать в "GOAT Угадай" — админ потом
+  # сможет добавить лучшие варианты в базу CHARACTERS вручную.
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS unknown_characters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            name TEXT,
+            created_at TEXT
+        )
+    """)
   conn.commit()
   conn.close()
 
@@ -63,7 +88,7 @@ init_db()
 
 def ensure_user(user_id, username):
   """Гарантирует наличие строки пользователя в БД."""
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute("SELECT user_id FROM scores WHERE user_id = ?", (user_id,))
   if not cursor.fetchone():
@@ -91,7 +116,7 @@ def add_xp(user_id, username, amount):
 
   Возвращает (leveled_up: bool, new_level: int, coins: int, xp: int)."""
   ensure_user(user_id, username)
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute(
       "SELECT xp, level, coins FROM scores WHERE user_id = ?", (user_id,)
@@ -118,7 +143,7 @@ def add_xp(user_id, username, amount):
 
 def add_coins(user_id, amount):
   """Начисляет монеты напрямую (например, бонус за победу), не трогая XP."""
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute(
       "UPDATE scores SET coins = coins + ? WHERE user_id = ?", (amount, user_id)
@@ -130,7 +155,7 @@ def add_coins(user_id, amount):
 def update_guess_stats(user_id, won, questions_used):
   """Обновляет статистику игры «GOAT Угадай»: сыграно, угадано, лучший
   результат (минимум вопросов при победе)."""
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute(
       "SELECT best_guess_questions FROM scores WHERE user_id = ?", (user_id,)
@@ -155,7 +180,7 @@ def update_guess_stats(user_id, won, questions_used):
 
 
 def get_profile_row(user_id):
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute(
       "SELECT score, streak, games, wins, messages_count, xp, level, coins,"
@@ -197,6 +222,32 @@ def fetch_pollinations_image(url, timeout=120, retries=2):
   return None
 
 
+MAX_USER_TEXT_LEN = 4000  # защита от чрезмерно длинных сообщений в Groq
+MAX_PROMPT_LEN = 500      # защита промпта генерации изображений (item 4/9)
+
+
+def format_ai_answer(raw_text):
+  """Безопасно готовит ответ модели к отправке с parse_mode=HTML: сначала
+  экранирует спецсимволы (чтобы модель не могла случайно/специально сломать
+  разметку — Bad Request: can't parse entities), и только потом превращает
+  наш markdown **bold** в теги <b>."""
+  escaped = html.escape(raw_text)
+  escaped = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", escaped)
+  return escaped
+
+
+def safe_html_send(chat_id, text, **kwargs):
+  """send_message с HTML, но с защитой: если разметка всё же не парсится
+  (например, модель вернула незакрытый тег), не роняем обработчик, а
+  отправляем как обычный текст."""
+  try:
+    return bot.send_message(chat_id, text, parse_mode="HTML", **kwargs)
+  except Exception as e:
+    print(f"Ошибка отправки HTML-сообщения, отправляю как plain text: {e}")
+    plain = re.sub(r"<[^>]+>", "", text)
+    return bot.send_message(chat_id, plain, **kwargs)
+
+
 def render_bar(current, total, length=10):
   if total <= 0:
     filled = 0
@@ -229,7 +280,7 @@ groq_api_key = os.environ.get("GROQ_API_KEY")
 if not groq_api_key:
   print("⚠️ Предупреждение: GROQ_API_KEY не найден в Secrets!")
 
-groq_client = Groq(api_key=groq_api_key)
+groq_client = Groq(api_key=groq_api_key, timeout=30.0, max_retries=1)
 GROQ_MODEL = os.environ.get(
     "GROQ_MODEL", "llama-3.3-70b-versatile"
 )  # ⚠️ отключается 16.08.26 — при необходимости переопределить через Secrets
@@ -258,10 +309,86 @@ game_sessions = {}   # user_id -> состояние текущей игры "П
 guess_sessions = {}  # user_id -> состояние игры "GOAT Угадай"
 user_states = {}     # user_id -> строка состояния ожидания (фото/текст)
 
-input_path = "input_photo.jpg"
-output_path = "output_no_bg.png"
-temp_in = "temp_in.jpg"
-temp_out = "temp_out.jpg"
+# ================================================================
+# 3б. RATE LIMIT — простая защита от флуда (в памяти, без Redis)
+# ================================================================
+_rate_limit_state = {}  # (user_id, category) -> [timestamps]
+_rate_limit_lock = threading.Lock()
+
+# (лимит запросов, окно в секундах) на категорию действия
+RATE_LIMITS = {
+    "chat": (8, 60),        # обычные сообщения в GOAT Chat
+    "image_gen": (3, 60),   # генерация изображений — тяжёлая операция
+    "game": (25, 60),       # кнопки игр — быстрые нажатия это нормально
+    "photo": (5, 60),       # обработка фото (фон/качество) — тяжёлая операция
+}
+
+
+def check_rate_limit(user_id, category):
+  """True — можно продолжать, False — превышен лимит (тихо, без побочных
+  эффектов на состояние — вызывающий код сам решает, что ответить)."""
+  limit, window = RATE_LIMITS[category]
+  now = time.monotonic()
+  key = (user_id, category)
+  with _rate_limit_lock:
+    timestamps = _rate_limit_state.get(key, [])
+    cutoff = now - window
+    timestamps = [t for t in timestamps if t >= cutoff]
+    if len(timestamps) >= limit:
+      _rate_limit_state[key] = timestamps
+      return False
+    timestamps.append(now)
+    _rate_limit_state[key] = timestamps
+    return True
+
+
+def rate_limited_reply(chat_id):
+  bot.send_message(chat_id, "⏳ Слишком много запросов. Подожди немного.")
+
+
+# ================================================================
+# 3в. ЗАЩИТА ОТ ДВОЙНОГО НАЖАТИЯ (гонка потоков в telebot)
+# ================================================================
+# pyTelegramBotAPI обрабатывает апдейты в отдельных потоках по умолчанию —
+# значит быстрый двойной тап по кнопке игры может запустить обработчик
+# дважды ПАРАЛЛЕЛЬНО, и оба потока начислят награду за один и тот же ответ.
+# Даём каждому пользователю персональный lock: пока обрабатывается один его
+# клик, повторный клик просто игнорируется (не встаёт в очередь и не ждёт).
+_user_locks = {}
+_user_locks_meta_lock = threading.Lock()
+
+
+def _get_user_lock(user_id):
+  with _user_locks_meta_lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+      lock = threading.Lock()
+      _user_locks[user_id] = lock
+    return lock
+
+
+def prevent_double_click(func):
+  """Декоратор для callback-обработчиков наград (игры): если предыдущий
+  клик этого же пользователя ещё обрабатывается — новый тихо игнорируется,
+  вместо того чтобы начислить награду дважды."""
+
+  @functools.wraps(func)
+  def wrapper(call, *args, **kwargs):
+    user_id = call.from_user.id
+    lock = _get_user_lock(user_id)
+    if not lock.acquire(blocking=False):
+      try:
+        bot.answer_callback_query(call.id, "⏳ Обработка...")
+      except Exception:
+        pass
+      return
+    try:
+      return func(call, *args, **kwargs)
+    finally:
+      lock.release()
+
+  return wrapper
+
 
 # ================================================================
 # 4. РОЛИ ДЛЯ GOAT CHAT
@@ -970,11 +1097,11 @@ def send_main_menu(chat_id, user_name):
   )
 
   welcome_text = (
-      f"🐐 <b>GOAT AI</b>\nДобро пожаловать, {user_name}!\n\n🎮 Загляните в"
-      " «Игры» — там «Правда или Ложь» и новая «GOAT Угадай»!\n\nВыберите"
-      " раздел:"
+      f"🐐 <b>GOAT AI</b>\nДобро пожаловать, {html.escape(user_name)}!\n\n🎮"
+      " Загляните в «Игры» — там «Правда или Ложь» и новая «GOAT"
+      " Угадай»!\n\nВыберите раздел:"
   )
-  bot.send_message(chat_id, welcome_text, reply_markup=markup, parse_mode="HTML")
+  safe_html_send(chat_id, welcome_text, reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "games_menu")
@@ -1040,24 +1167,207 @@ def cb_help(call):
   send_help(call.message)
 
 
+def _is_admin(user_id):
+  return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+def _admin_panel_markup():
+  markup = types.InlineKeyboardMarkup(row_width=1)
+  markup.add(
+      types.InlineKeyboardButton("👤 Пользователи", callback_data="admin_users"),
+      types.InlineKeyboardButton(
+          "🧠 Неугаданные персонажи", callback_data="admin_unknown"
+      ),
+      types.InlineKeyboardButton(
+          "📊 Статистика игры", callback_data="admin_stats"
+      ),
+      types.InlineKeyboardButton(
+          "📩 Последние предложения", callback_data="admin_recent"
+      ),
+      types.InlineKeyboardButton(
+          "🗑 Очистить список", callback_data="admin_clear_unknown"
+      ),
+  )
+  return markup
+
+
 @bot.message_handler(commands=["admin"])
 def cmd_admin(message):
-  user_id = message.from_user.id
-  if ADMIN_ID and user_id != ADMIN_ID:
+  if not _is_admin(message.from_user.id):
     bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде.")
     return
+  bot.send_message(
+      message.chat.id,
+      "🛠 <b>Панель администратора (GOAT AI)</b>",
+      reply_markup=_admin_panel_markup(),
+      parse_mode="HTML",
+  )
 
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_users")
+def cb_admin_users(call):
+  bot.answer_callback_query(call.id)
+  if not _is_admin(call.from_user.id):
+    return
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute("SELECT COUNT(*) FROM scores")
   total_users = cursor.fetchone()[0]
+  cursor.execute(
+      "SELECT COUNT(*) FROM scores WHERE messages_count > 0 OR games > 0 OR"
+      " guess_games > 0"
+  )
+  active_users = cursor.fetchone()[0]
+  cursor.execute("SELECT SUM(messages_count) FROM scores")
+  total_messages = cursor.fetchone()[0] or 0
   conn.close()
 
   text = (
-      f"🛠 <b>Панель администратора (GOAT AI)</b>\n\n👥 Всего пользователей в"
-      f" базе: <b>{total_users}</b>\n🟢 Статус: Активен 24/7"
+      "👤 <b>Пользователи</b>\n\nВсего в базе: <b>{}</b>\nАктивных"
+      " (есть игры/сообщения): <b>{}</b>\nВсего сообщений: <b>{}</b>"
+  ).format(total_users, active_users, total_messages)
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в панель", callback_data="admin_panel")
   )
-  bot.send_message(message.chat.id, text, parse_mode="HTML")
+  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_stats")
+def cb_admin_stats(call):
+  bot.answer_callback_query(call.id)
+  if not _is_admin(call.from_user.id):
+    return
+  conn = db_connect()
+  cursor = conn.cursor()
+  cursor.execute("SELECT SUM(games), SUM(wins) FROM scores")
+  tl_games, tl_wins = cursor.fetchone()
+  tl_games = tl_games or 0
+  tl_wins = tl_wins or 0
+  cursor.execute("SELECT SUM(guess_games), SUM(guess_wins) FROM scores")
+  guess_games, guess_wins = cursor.fetchone()
+  guess_games = guess_games or 0
+  guess_wins = guess_wins or 0
+  cursor.execute("SELECT COUNT(*) FROM unknown_characters")
+  unknown_count = cursor.fetchone()[0]
+  conn.close()
+
+  tl_rate = f"{(tl_wins / tl_games * 100):.0f}%" if tl_games else "—"
+  guess_rate = f"{(guess_wins / guess_games * 100):.0f}%" if guess_games else "—"
+
+  text = (
+      "📊 <b>Статистика игр</b>\n\n🧠 <b>Правда или Ложь</b>\nСыграно раундов:"
+      f" {tl_games}\nПравильных ответов: {tl_wins} ({tl_rate})\n\n🔮 <b>GOAT"
+      f" Угадай</b>\nСыграно игр: {guess_games}\nУгадано: {guess_wins}"
+      f" ({guess_rate})\nНе распознано персонажей: {unknown_count}"
+  )
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в панель", callback_data="admin_panel")
+  )
+  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+def _format_unknown_list(rows, title):
+  if not rows:
+    return f"{title}\n\nПока пусто."
+  lines = [title, ""]
+  for name, cnt, last_date in rows:
+    safe_name = html.escape(name)[:60]
+    date_part = (last_date or "")[:16]
+    lines.append(f"• <b>{safe_name}</b> — {cnt}x ({date_part})")
+  return "\n".join(lines)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_unknown")
+def cb_admin_unknown(call):
+  bot.answer_callback_query(call.id)
+  if not _is_admin(call.from_user.id):
+    return
+  conn = db_connect()
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT name, COUNT(*) as cnt, MAX(created_at) FROM unknown_characters"
+      " GROUP BY LOWER(name) ORDER BY cnt DESC, MAX(created_at) DESC LIMIT 20"
+  )
+  rows = cursor.fetchall()
+  conn.close()
+
+  text = _format_unknown_list(
+      rows, "🧠 <b>Неугаданные персонажи</b>\n(сгруппировано, топ-20 по частоте)"
+  )
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в панель", callback_data="admin_panel")
+  )
+  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_recent")
+def cb_admin_recent(call):
+  bot.answer_callback_query(call.id)
+  if not _is_admin(call.from_user.id):
+    return
+  conn = db_connect()
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT name, username, created_at FROM unknown_characters ORDER BY id"
+      " DESC LIMIT 15"
+  )
+  rows = cursor.fetchall()
+  conn.close()
+
+  if not rows:
+    text = "📩 <b>Последние предложения</b>\n\nПока пусто."
+  else:
+    lines = ["📩 <b>Последние предложения</b>\n"]
+    for name, username, created_at in rows:
+      safe_name = html.escape(name)[:60]
+      safe_user = html.escape(username or "аноним")[:30]
+      date_part = (created_at or "")[:16]
+      lines.append(f"• <b>{safe_name}</b> — от {safe_user} ({date_part})")
+    text = "\n".join(lines)
+
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в панель", callback_data="admin_panel")
+  )
+  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_clear_unknown")
+def cb_admin_clear_unknown(call):
+  bot.answer_callback_query(call.id)
+  if not _is_admin(call.from_user.id):
+    return
+  conn = db_connect()
+  cursor = conn.cursor()
+  cursor.execute("DELETE FROM unknown_characters")
+  conn.commit()
+  conn.close()
+
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("⬅️ Назад в панель", callback_data="admin_panel")
+  )
+  bot.send_message(
+      call.message.chat.id,
+      "🗑 Список неугаданных персонажей очищен.",
+      reply_markup=markup,
+  )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_panel")
+def cb_admin_panel(call):
+  bot.answer_callback_query(call.id)
+  if not _is_admin(call.from_user.id):
+    return
+  bot.send_message(
+      call.message.chat.id,
+      "🛠 <b>Панель администратора (GOAT AI)</b>",
+      reply_markup=_admin_panel_markup(),
+      parse_mode="HTML",
+  )
 
 
 # ================================================================
@@ -1069,7 +1379,7 @@ def cb_goat_chat(call):
   user_id = call.from_user.id
   ensure_user(user_id, call.from_user.first_name or "друг")
 
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute("SELECT active_mode FROM scores WHERE user_id = ?", (user_id,))
   row = cursor.fetchone()
@@ -1106,7 +1416,7 @@ def cb_set_mode(call):
     user_id = call.from_user.id
     ensure_user(user_id, call.from_user.first_name or "друг")
     user_modes[call.message.chat.id] = mode_key
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = db_connect()
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE scores SET active_mode = ? WHERE user_id = ?",
@@ -1163,7 +1473,7 @@ def cb_profile(call):
   needed = xp_needed_for_level(level)
   bar = render_bar(xp, needed)
 
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute("SELECT active_mode FROM scores WHERE user_id = ?", (user_id,))
   mode_row = cursor.fetchone()
@@ -1171,7 +1481,7 @@ def cb_profile(call):
   active_mode_key = mode_row[0] if mode_row and mode_row[0] in ROLES else DEFAULT_ROLE_KEY
   active_mode_name = ROLES[active_mode_key]["name"]
 
-  user_name = call.from_user.first_name or "друг"
+  user_name = html.escape(call.from_user.first_name or "друг")
   text = (
       f"👤 <b>{user_name}</b>\n"
       "━━━━━━━━━━━━━━━━\n"
@@ -1194,7 +1504,7 @@ def cb_profile(call):
       types.InlineKeyboardButton("🏆 Рейтинг", callback_data="show_leaderboard"),
       types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
   )
-  bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+  safe_html_send(call.message.chat.id, text, reply_markup=markup)
 
 
 # ================================================================
@@ -1282,7 +1592,7 @@ def command_top(message):
 
 
 def start_quiz_session(chat_id, user_id):
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute("SELECT score FROM scores WHERE user_id = ?", (user_id,))
   row = cursor.fetchone()
@@ -1325,17 +1635,22 @@ def start_quiz_session(chat_id, user_id):
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "start_chat_game")
+@prevent_double_click
 def cb_start_chat_game(call):
   bot.answer_callback_query(call.id)
   start_quiz_session(call.message.chat.id, call.from_user.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data in ["ans_true", "ans_false"])
+@prevent_double_click
 def cb_game_answer(call):
   bot.answer_callback_query(call.id)
   user_id = call.from_user.id
   username = call.from_user.first_name or "Игрок"
   ensure_user(user_id, username)
+
+  if not check_rate_limit(user_id, "game"):
+    return  # тихо игнорируем — лимит только для явного флуда, не мешаем игре
 
   if user_id not in game_sessions:
     start_quiz_session(call.message.chat.id, user_id)
@@ -1343,11 +1658,16 @@ def cb_game_answer(call):
 
   session = game_sessions[user_id]
   user_choice = call.data == "ans_true"
-  q_index = session["q_index"]
+  q_index = session.get("q_index")
+  if q_index is None or not (0 <= q_index < len(QUESTIONS)):
+    # Устаревшая/повреждённая сессия — просто начинаем новый раунд
+    game_sessions.pop(user_id, None)
+    start_quiz_session(call.message.chat.id, user_id)
+    return
   q_data = QUESTIONS[q_index]
   correct = q_data["truth"]
 
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute(
       "SELECT score, streak, games, wins FROM scores WHERE user_id = ?",
@@ -1547,17 +1867,28 @@ def _guess_ask_for_name(chat_id, user_id):
 
 def _guess_receive_unknown_name(message, user_id):
   chat_id = message.chat.id
-  name = (message.text or "").strip()
+  name = (message.text or "").strip()[:100]
   update_guess_stats(user_id, won=False, questions_used=0)
 
   if name and not name.startswith("/"):
-    notify_admin_error(
-        "новый персонаж для 'GOAT Угадай'",
-        f"Пользователь {message.from_user.first_name} загадал: {name}",
-    )
+    try:
+      conn = db_connect()
+      cursor = conn.cursor()
+      cursor.execute(
+          "INSERT INTO unknown_characters (user_id, username, name,"
+          " created_at) VALUES (?, ?, ?, datetime('now'))",
+          (user_id, message.from_user.first_name or "аноним", name),
+      )
+      conn.commit()
+      conn.close()
+    except Exception as e:
+      print(f"Ошибка сохранения неизвестного персонажа: {e}")
+      notify_admin_error("сохранение неизвестного персонажа", e)
+
+    safe_name = html.escape(name)
     reply_text = (
-        f"Спасибо! Запомнил — <b>{name}</b>. Добавим этот вариант в базу в"
-        " будущем 🙌"
+        f"Спасибо! Запомнил — <b>{safe_name}</b>. Добавим этот вариант в"
+        " базу в будущем 🙌"
     )
   else:
     reply_text = "Ладно, в другой раз угадаю! 😄"
@@ -1614,6 +1945,7 @@ def cb_start_guess_game(call):
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "guess_begin")
+@prevent_double_click
 def cb_guess_begin(call):
   bot.answer_callback_query(call.id)
   chat_id = call.message.chat.id
@@ -1634,10 +1966,13 @@ def cb_guess_begin(call):
 @bot.callback_query_handler(
     func=lambda call: call.data in ["guess_yes", "guess_no", "guess_dunno"]
 )
+@prevent_double_click
 def cb_guess_answer(call):
   bot.answer_callback_query(call.id)
   chat_id = call.message.chat.id
   user_id = call.from_user.id
+  if not check_rate_limit(user_id, "game"):
+    return
   session = guess_sessions.get(user_id)
   if not session or session.get("mode") != "question":
     return
@@ -1653,10 +1988,13 @@ def cb_guess_answer(call):
 @bot.callback_query_handler(
     func=lambda call: call.data in ["guess_correct", "guess_incorrect"]
 )
+@prevent_double_click
 def cb_guess_result(call):
   bot.answer_callback_query(call.id)
   chat_id = call.message.chat.id
   user_id = call.from_user.id
+  if not check_rate_limit(user_id, "game"):
+    return
   session = guess_sessions.get(user_id)
   if not session or session.get("mode") != "guess_confirm":
     return
@@ -1717,7 +2055,7 @@ def cb_guess_end(call):
 
 
 def send_leaderboard(chat_id, user_id, edit_message_id=None):
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  conn = db_connect()
   cursor = conn.cursor()
   cursor.execute(
       "SELECT username, score, streak, games FROM scores ORDER BY score DESC"
@@ -1754,7 +2092,8 @@ def send_leaderboard(chat_id, user_id, edit_message_id=None):
       medal = (
           "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
       )
-      lb_text += f"{medal} <b>{p_name}</b> — {p_score} очков (🔥{p_streak})\n"
+      safe_name = html.escape(p_name or "Игрок")
+      lb_text += f"{medal} <b>{safe_name}</b> — {p_score} очков (🔥{p_streak})\n"
 
   markup = types.InlineKeyboardMarkup()
   markup.add(
@@ -1774,7 +2113,7 @@ def send_leaderboard(chat_id, user_id, edit_message_id=None):
       return
     except Exception:
       pass
-  bot.send_message(chat_id, lb_text, reply_markup=markup, parse_mode="HTML")
+  safe_html_send(chat_id, lb_text, reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_leaderboard")
@@ -1836,26 +2175,45 @@ def cb_gen_new(call):
 
 def process_image_prompt(message):
   user_id = message.from_user.id
-  if not require_subscription(message.chat.id, user_id):
+  chat_id = message.chat.id
+  if not require_subscription(chat_id, user_id):
+    return
+
+  if not check_rate_limit(user_id, "image_gen"):
+    rate_limited_reply(chat_id)
     return
 
   prompt = (message.text or "").strip()
   if not prompt or prompt.startswith("/"):
-    bot.send_message(message.chat.id, "❌ Генерация отменена.")
+    bot.send_message(chat_id, "❌ Генерация отменена.")
     return
 
+  if len(prompt) > MAX_PROMPT_LEN:
+    bot.send_message(
+        chat_id,
+        f"📄 Описание слишком длинное. Сократи его примерно до"
+        f" {MAX_PROMPT_LEN} символов.",
+    )
+    return
+
+  safe_prompt = html.escape(prompt)
   status_msg = bot.send_message(
-      message.chat.id,
-      f"🎨 Создаю арт по запросу: <i>«{prompt}»</i>...",
+      chat_id,
+      f"🎨 Создаю арт по запросу: <i>«{safe_prompt}»</i>...",
       parse_mode="HTML",
   )
-  bot.send_chat_action(message.chat.id, "upload_photo")
+  bot.send_chat_action(chat_id, "upload_photo")
 
   try:
-    english_prompt = translate_to_english(prompt)
+    try:
+      english_prompt = translate_to_english(prompt)
+    except Exception as e:
+      print(f"Ошибка перевода промпта: {e}")
+      notify_admin_error("Groq — перевод промпта генерации", e)
+      english_prompt = prompt  # не критично, попробуем сгенерировать как есть
 
     seed = random.randint(1, 1000000)
-    encoded_prompt = urllib.parse.quote(english_prompt)
+    encoded_prompt = urllib.parse.quote(english_prompt[:MAX_PROMPT_LEN])
     image_url = (
         f"https://image.pollinations.ai/prompt/{encoded_prompt}"
         f"?model=flux&width=1024&height=1024&nologo=true&enhance=true"
@@ -1865,34 +2223,38 @@ def process_image_prompt(message):
     image_bytes = fetch_pollinations_image(image_url)
     if not image_bytes:
       bot.send_message(
-          message.chat.id,
+          chat_id,
           "❌ Сервис генерации сейчас не отвечает. Попробуйте ещё раз через"
           " минуту.",
       )
-      bot.delete_message(message.chat.id, status_msg.message_id)
+      bot.delete_message(chat_id, status_msg.message_id)
       return
 
     bot.send_photo(
-        message.chat.id,
+        chat_id,
         io.BytesIO(image_bytes),
-        caption=f"✨ <b>Запрос:</b> {prompt}",
+        caption=f"✨ <b>Запрос:</b> {safe_prompt}",
         parse_mode="HTML",
     )
-    bot.delete_message(message.chat.id, status_msg.message_id)
+    bot.delete_message(chat_id, status_msg.message_id)
 
     leveled_up, new_level, coins, xp = add_xp(
         user_id, message.from_user.first_name or "друг", 15
     )
     if leveled_up:
-      send_level_up_message(message.chat.id, new_level, coins)
+      send_level_up_message(chat_id, new_level, coins)
   except Exception as e:
     print(f"Ошибка генерации изображения: {e}")
-    bot.send_message(message.chat.id, "❌ Не удалось сгенерировать изображение.")
+    bot.send_message(chat_id, "❌ Не удалось сгенерировать изображение.")
+    notify_admin_error("генерация изображения", e)
 
 
 # ================================================================
 # 15. ОБРАБОТКА ФОТО (анализ / удаление фона / улучшение качества)
 # ================================================================
+MAX_PHOTO_SIZE_BYTES = 15 * 1024 * 1024  # 15 МБ — разумный предел на фото
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
   chat_id = message.chat.id
@@ -1910,22 +2272,49 @@ def handle_photo(message):
     user_states.pop(user_id, None)
     return
 
+  if not check_rate_limit(user_id, "photo"):
+    rate_limited_reply(chat_id)
+    return
+
+  photo = message.photo[-1]
+  if photo.file_size and photo.file_size > MAX_PHOTO_SIZE_BYTES:
+    bot.send_message(
+        chat_id, "📄 Файл слишком большой. Пришлите фото поменьше (до 15 МБ)."
+    )
+    return
+
+  # Уникальные имена на пользователя — чтобы два человека, обрабатывающих
+  # фото одновременно, не перезаписали файлы друг друга.
+  user_input_path = f"input_photo_{user_id}.jpg"
+  user_output_path = f"output_no_bg_{user_id}.png"
+  user_temp_in = f"temp_in_{user_id}.jpg"
+  user_temp_out = f"temp_out_{user_id}.jpg"
+
   if any(k in caption for k in ["/bg", "фон", "удалить фон"]):
     processing_msg = bot.send_message(
         chat_id, "✂️ <b>Удаление фона...</b>", parse_mode="HTML"
     )
     try:
-      from rembg import remove
+      try:
+        from rembg import remove
+      except ImportError as e:
+        print(f"rembg недоступен: {e}")
+        notify_admin_error("rembg недоступен", e)
+        bot.send_message(
+            chat_id, "❌ Функция удаления фона временно недоступна."
+        )
+        bot.delete_message(chat_id, processing_msg.message_id)
+        return
 
-      file_info = bot.get_file(message.photo[-1].file_id)
+      file_info = bot.get_file(photo.file_id)
       downloaded_file = bot.download_file(file_info.file_path)
-      with open(input_path, "wb") as f:
+      with open(user_input_path, "wb") as f:
         f.write(downloaded_file)
-      with open(input_path, "rb") as i:
+      with open(user_input_path, "rb") as i:
         output_image = remove(i.read())
-      with open(output_path, "wb") as o:
+      with open(user_output_path, "wb") as o:
         o.write(output_image)
-      with open(output_path, "rb") as doc:
+      with open(user_output_path, "rb") as doc:
         bot.send_document(
             chat_id,
             doc,
@@ -1936,26 +2325,27 @@ def handle_photo(message):
     except Exception as e:
       print(f"Ошибка удаления фона: {e}")
       bot.send_message(chat_id, "❌ Ошибка при обработке фото.")
+      notify_admin_error("удаление фона", e)
     finally:
-      if os.path.exists(input_path):
-        os.remove(input_path)
-      if os.path.exists(output_path):
-        os.remove(output_path)
+      if os.path.exists(user_input_path):
+        os.remove(user_input_path)
+      if os.path.exists(user_output_path):
+        os.remove(user_output_path)
     return
 
   processing_msg = bot.send_message(
       chat_id, "✨ <b>Улучшение качества...</b>", parse_mode="HTML"
   )
   try:
-    file_info = bot.get_file(message.photo[-1].file_id)
+    file_info = bot.get_file(photo.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
-    with open(temp_in, "wb") as f:
+    with open(user_temp_in, "wb") as f:
       f.write(downloaded_file)
-    img = Image.open(temp_in).convert("RGB")
+    img = Image.open(user_temp_in).convert("RGB")
     img = ImageEnhance.Sharpness(img).enhance(1.3)
     img = ImageEnhance.Color(img).enhance(1.1)
-    img.save(temp_out, quality=95)
-    with open(temp_out, "rb") as photo_to_send:
+    img.save(user_temp_out, quality=95)
+    with open(user_temp_out, "rb") as photo_to_send:
       bot.send_photo(
           chat_id,
           photo_to_send,
@@ -1966,11 +2356,12 @@ def handle_photo(message):
   except Exception as e:
     print(f"Ошибка улучшения фото: {e}")
     bot.send_message(chat_id, "❌ Не удалось улучшить фото.")
+    notify_admin_error("улучшение фото", e)
   finally:
-    if os.path.exists(temp_in):
-      os.remove(temp_in)
-    if os.path.exists(temp_out):
-      os.remove(temp_out)
+    if os.path.exists(user_temp_in):
+      os.remove(user_temp_in)
+    if os.path.exists(user_temp_out):
+      os.remove(user_temp_out)
 
 
 # ================================================================
@@ -1980,30 +2371,57 @@ def handle_photo(message):
 def handle_message(message):
   user_id = message.from_user.id
   username = message.from_user.first_name or "друг"
-  if not require_subscription(message.chat.id, user_id):
+  chat_id = message.chat.id
+
+  if not message.text:
+    return  # стикеры/голосовые и т.п. сюда не должны попадать, но на всякий
+
+  if not require_subscription(chat_id, user_id):
+    return
+
+  if not check_rate_limit(user_id, "chat"):
+    rate_limited_reply(chat_id)
+    return
+
+  user_text = message.text
+  if len(user_text) > MAX_USER_TEXT_LEN:
+    bot.send_message(
+        chat_id,
+        f"📄 Текст слишком большой. Сократи его примерно до"
+        f" {MAX_USER_TEXT_LEN} символов.",
+    )
     return
 
   ensure_user(user_id, username)
 
-  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-  cursor = conn.cursor()
-  cursor.execute(
-      "UPDATE scores SET messages_count = messages_count + 1 WHERE user_id = ?",
-      (user_id,),
-  )
-  cursor.execute("SELECT active_mode FROM scores WHERE user_id = ?", (user_id,))
-  mode_row = cursor.fetchone()
-  conn.commit()
-  conn.close()
+  try:
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE scores SET messages_count = messages_count + 1 WHERE"
+        " user_id = ?",
+        (user_id,),
+    )
+    cursor.execute(
+        "SELECT active_mode FROM scores WHERE user_id = ?", (user_id,)
+    )
+    mode_row = cursor.fetchone()
+    conn.commit()
+    conn.close()
+  except sqlite3.Error as e:
+    print(f"Ошибка БД в handle_message: {e}")
+    notify_admin_error("БД: handle_message", e)
+    mode_row = None
 
   if not groq_api_key:
-    bot.send_message(message.chat.id, "❌ Ключ Groq API не настроен в Secrets.")
+    bot.send_message(chat_id, "⚠️ ИИ временно недоступен. Попробуйте немного позже.")
+    notify_admin_error("Groq не настроен", "GROQ_API_KEY отсутствует в Secrets")
     return
 
-  bot.send_chat_action(message.chat.id, "typing")
+  bot.send_chat_action(chat_id, "typing")
 
   current_mode_key = user_modes.get(
-      message.chat.id,
+      chat_id,
       mode_row[0] if mode_row and mode_row[0] in ROLES else DEFAULT_ROLE_KEY,
   )
   role_info = ROLES.get(current_mode_key, ROLES[DEFAULT_ROLE_KEY])
@@ -2015,28 +2433,64 @@ def handle_message(message):
     chat_completion = groq_client.chat.completions.create(
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message.text},
+            {"role": "user", "content": user_text},
         ],
         model=GROQ_MODEL,
     )
-    answer = chat_completion.choices[0].message.content.strip()
-    answer = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", answer)
+    raw_answer = (chat_completion.choices[0].message.content or "").strip()
+    if not raw_answer:
+      raise ValueError("Groq вернул пустой ответ")
+    answer = format_ai_answer(raw_answer)
 
     if show_header:
-      formatted_response = f"<b>{role_name}:</b>\n\n{answer}"
+      formatted_response = f"<b>{html.escape(role_name)}:</b>\n\n{answer}"
     else:
       formatted_response = answer
 
-    bot.send_message(message.chat.id, formatted_response, parse_mode="HTML")
+    safe_html_send(chat_id, formatted_response)
 
     leveled_up, new_level, coins, xp = add_xp(user_id, username, 3)
     if leveled_up:
-      send_level_up_message(message.chat.id, new_level, coins)
+      send_level_up_message(chat_id, new_level, coins)
   except Exception as e:
     print(f"Ошибка Groq API: {e}")
-    bot.send_message(
-        message.chat.id, "❌ Произошла ошибка при обращении к нейросети."
-    )
+    bot.send_message(chat_id, "⚠️ ИИ временно недоступен. Попробуйте немного позже.")
+    notify_admin_error("Groq API — GOAT Chat", e)
+
+
+# ================================================================
+# 16б. ОГРАНИЧЕНИЕ РОСТА ПАМЯТИ — периодическая подрезка in-memory словарей
+# ================================================================
+# user_modes/game_sessions/guess_sessions/user_states живут только в RAM и
+# потенциально могут расти бесконечно (например, если многие пользователи
+# один раз зайдут в игру и больше не вернутся — их сессии никогда не
+# удалятся сами). Без сложной TTL-системы: если словарь становится слишком
+# большим, просто подрезаем самые старые записи (первыми вставленные).
+_MEMORY_CAP = 3000
+
+
+def _trim_dict(d, cap=_MEMORY_CAP):
+  overflow = len(d) - cap
+  if overflow <= 0:
+    return
+  for key in list(d.keys())[:overflow]:
+    d.pop(key, None)
+
+
+def _memory_cleanup_loop():
+  while True:
+    time.sleep(1800)  # каждые 30 минут — не критично, просто подстраховка
+    try:
+      _trim_dict(user_modes)
+      _trim_dict(game_sessions)
+      _trim_dict(guess_sessions)
+      _trim_dict(user_states)
+      with _rate_limit_lock:
+        _trim_dict(_rate_limit_state, cap=_MEMORY_CAP * 2)
+      with _user_locks_meta_lock:
+        _trim_dict(_user_locks, cap=_MEMORY_CAP)
+    except Exception as e:
+      print(f"Ошибка очистки памяти: {e}")
 
 
 # ================================================================
@@ -2048,6 +2502,10 @@ def run_bot():
 
 
 if __name__ == "__main__":
+  cleanup_thread = threading.Thread(target=_memory_cleanup_loop)
+  cleanup_thread.daemon = True
+  cleanup_thread.start()
+
   bot_thread = threading.Thread(target=run_bot)
   bot_thread.daemon = True
   bot_thread.start()
