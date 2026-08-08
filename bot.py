@@ -10,7 +10,7 @@ import requests
 import telebot
 from flask import Flask
 from groq import Groq
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+from PIL import Image, ImageEnhance
 from telebot import types
 
 # ================================================================
@@ -48,6 +48,12 @@ def init_db():
   _add_column_if_missing(cursor, "scores", "coins", "INTEGER DEFAULT 0")
   _add_column_if_missing(cursor, "scores", "active_mode", "TEXT DEFAULT 'default'")
   _add_column_if_missing(cursor, "scores", "joined_at", "TEXT")
+  # Статистика для игры "GOAT Угадай"
+  _add_column_if_missing(cursor, "scores", "guess_games", "INTEGER DEFAULT 0")
+  _add_column_if_missing(cursor, "scores", "guess_wins", "INTEGER DEFAULT 0")
+  _add_column_if_missing(
+      cursor, "scores", "best_guess_questions", "INTEGER DEFAULT 0"
+  )
   conn.commit()
   conn.close()
 
@@ -110,12 +116,51 @@ def add_xp(user_id, username, amount):
   return leveled_up, level, coins, xp
 
 
+def add_coins(user_id, amount):
+  """Начисляет монеты напрямую (например, бонус за победу), не трогая XP."""
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  cursor = conn.cursor()
+  cursor.execute(
+      "UPDATE scores SET coins = coins + ? WHERE user_id = ?", (amount, user_id)
+  )
+  conn.commit()
+  conn.close()
+
+
+def update_guess_stats(user_id, won, questions_used):
+  """Обновляет статистику игры «GOAT Угадай»: сыграно, угадано, лучший
+  результат (минимум вопросов при победе)."""
+  conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT best_guess_questions FROM scores WHERE user_id = ?", (user_id,)
+  )
+  row = cursor.fetchone()
+  best = row[0] if row and row[0] else 0
+
+  if won:
+    new_best = questions_used if best == 0 else min(best, questions_used)
+    cursor.execute(
+        "UPDATE scores SET guess_games = guess_games + 1, guess_wins ="
+        " guess_wins + 1, best_guess_questions = ? WHERE user_id = ?",
+        (new_best, user_id),
+    )
+  else:
+    cursor.execute(
+        "UPDATE scores SET guess_games = guess_games + 1 WHERE user_id = ?",
+        (user_id,),
+    )
+  conn.commit()
+  conn.close()
+
+
 def get_profile_row(user_id):
   conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
   cursor.execute(
-      "SELECT score, streak, games, wins, messages_count, xp, level, coins"
-      " FROM scores WHERE user_id = ?",
+      "SELECT score, streak, games, wins, messages_count, xp, level, coins,"
+      " guess_games, guess_wins, best_guess_questions FROM scores WHERE"
+      " user_id = ?",
       (user_id,),
   )
   row = cursor.fetchone()
@@ -185,7 +230,9 @@ if not groq_api_key:
   print("⚠️ Предупреждение: GROQ_API_KEY не найден в Secrets!")
 
 groq_client = Groq(api_key=groq_api_key)
-GROQ_MODEL = "llama-3.3-70b-versatile"  # ⚠️ отключается 16.08.26, нужна миграция
+GROQ_MODEL = os.environ.get(
+    "GROQ_MODEL", "llama-3.3-70b-versatile"
+)  # ⚠️ отключается 16.08.26 — при необходимости переопределить через Secrets
 
 CHANNEL_ID = "@goatai_news"
 CHANNEL_URL = "https://t.me/goatai_news"
@@ -207,29 +254,14 @@ def notify_admin_error(context, error_text):
     print(f"Не удалось уведомить админа об ошибке: {notify_err}")
 
 user_modes = {}      # chat_id -> ключ роли GOAT Chat (в памяти, для скорости)
-game_sessions = {}   # user_id -> состояние текущей игры
+game_sessions = {}   # user_id -> состояние текущей игры "Правда или Ложь"
+guess_sessions = {}  # user_id -> состояние игры "GOAT Угадай"
 user_states = {}     # user_id -> строка состояния ожидания (фото/текст)
 
 input_path = "input_photo.jpg"
 output_path = "output_no_bg.png"
 temp_in = "temp_in.jpg"
 temp_out = "temp_out.jpg"
-
-HONESTY_RULE = (
-    "Правило: твой анализ всегда честный. Без лести. Без грубости."
-    " Только аргументы и конкретные, применимые советы. Пиши строго на"
-    " русском языке. Отвечай простыми словами, без сложных терминов и"
-    " профессионального жаргона — как будто объясняешь другу. Формат: 3-4"
-    " коротких пункта, без воды. Пиши предметно именно про то, что тебе"
-    " прислали, а не общими фразами."
-)
-
-ANALYST_SYSTEM_PROMPT = (
-    "Ты — универсальный аналитик GOAT. Тебе присылают что угодно: бизнес-"
-    "идею, текст, кусок кода, план, вопрос, описание ситуации — и что бы"
-    " это ни было, ты сам определяешь, о чём речь, и даёшь по этому честный,"
-    " предметный разбор. " + HONESTY_RULE
-)
 
 # ================================================================
 # 4. РОЛИ ДЛЯ GOAT CHAT
@@ -328,11 +360,6 @@ ROLES = {
     },
 }
 DEFAULT_ROLE_KEY = "assistant"
-
-# ================================================================
-# 5. GOAT АНАЛИЗ — единый режим "Аналитик" (без категорий и кнопок)
-# ================================================================
-# см. ANALYST_SYSTEM_PROMPT выше
 
 
 # ================================================================
@@ -660,8 +687,218 @@ QUESTIONS = [
 
 
 # ================================================================
-# 7. ПОДПИСКА НА КАНАЛ
+# 6б. ИГРА "GOAT УГАДАЙ" — локальная база персонажей + фильтрация
 # ================================================================
+# Признаки: у каждого персонажа все ключи заполнены True/False.
+# real — реальный человек; animal — животное; остальные — сфера/категория.
+GUESS_FEATURE_KEYS = [
+    "real",
+    "male",
+    "animal",
+    "sport",
+    "football",
+    "basketball",
+    "mma",
+    "blogger",
+    "musician",
+    "actor",
+    "politician",
+    "videogame_character",
+    "movie_character",
+    "cartoon_character",
+    "superhero",
+    "anime_character",
+    "from_russia",
+    "from_usa",
+    "over_30",
+]
+
+GUESS_FEATURE_QUESTIONS = {
+    "real": "Это реальный человек?",
+    "male": "Это мужчина?",
+    "animal": "Это животное?",
+    "sport": "Он(-а) связан(-а) со спортом?",
+    "football": "Он(-а) связан(-а) с футболом?",
+    "basketball": "Он(-а) связан(-а) с баскетболом?",
+    "mma": "Он(-а) связан(-а) с UFC или MMA?",
+    "blogger": "Он(-а) известен(-на) в интернете (блогер/стример)?",
+    "musician": "Он(-а) музыкант?",
+    "actor": "Он(-а) актёр/актриса?",
+    "politician": "Он(-а) политик?",
+    "videogame_character": "Это персонаж из видеоигры?",
+    "movie_character": "Это персонаж из фильма?",
+    "cartoon_character": "Это персонаж из мультфильма?",
+    "superhero": "Он(-а) обладает суперспособностями?",
+    "anime_character": "Это персонаж из аниме?",
+    "from_russia": "Он(-а) известен(-на) в первую очередь в России?",
+    "from_usa": "Он(-а) из США?",
+    "over_30": "Ему/ей (или на вид) больше 30 лет?",
+}
+
+# Порядок предпочтений для самых первых вопросов — задаём общие признаки
+# раньше специфичных, чтобы быстрее отсекать целые категории.
+GUESS_PRIORITY_ORDER = [
+    "real",
+    "animal",
+    "male",
+    "sport",
+    "blogger",
+    "musician",
+    "actor",
+    "football",
+    "basketball",
+    "mma",
+    "politician",
+    "videogame_character",
+    "movie_character",
+    "cartoon_character",
+    "superhero",
+    "anime_character",
+    "from_russia",
+    "from_usa",
+    "over_30",
+]
+
+
+def _char(name, **kwargs):
+  entry = {key: False for key in GUESS_FEATURE_KEYS}
+  entry["name"] = name
+  entry.update(kwargs)
+  return entry
+
+
+CHARACTERS = [
+    # --- Футболисты ---
+    _char("Криштиану Роналду", real=True, male=True, sport=True, football=True, over_30=True),
+    _char("Лионель Месси", real=True, male=True, sport=True, football=True, over_30=True),
+    _char("Неймар", real=True, male=True, sport=True, football=True, over_30=True),
+    _char("Килиан Мбаппе", real=True, male=True, sport=True, football=True, over_30=True),
+    _char("Эрлинг Холанд", real=True, male=True, sport=True, football=True, from_usa=False),
+    _char("Роналдиньо", real=True, male=True, sport=True, football=True, over_30=True),
+    # --- MMA / UFC ---
+    _char("Хабиб Нурмагомедов", real=True, male=True, sport=True, mma=True, from_russia=True, over_30=True),
+    _char("Конор Макгрегор", real=True, male=True, sport=True, mma=True, over_30=True),
+    _char("Джон Джонс", real=True, male=True, sport=True, mma=True, from_usa=True, over_30=True),
+    _char("Александр Волкановски", real=True, male=True, sport=True, mma=True, over_30=True),
+    # --- Баскетбол ---
+    _char("Леброн Джеймс", real=True, male=True, sport=True, basketball=True, from_usa=True, over_30=True),
+    _char("Майкл Джордан", real=True, male=True, sport=True, basketball=True, from_usa=True, over_30=True),
+    _char("Стефен Карри", real=True, male=True, sport=True, basketball=True, from_usa=True, over_30=True),
+    # --- Музыканты ---
+    _char("Эминем", real=True, male=True, musician=True, from_usa=True, over_30=True),
+    _char("Дрейк", real=True, male=True, musician=True, from_usa=True, over_30=True),
+    _char("Билли Айлиш", real=True, male=False, musician=True, from_usa=True, over_30=False),
+    _char("Тейлор Свифт", real=True, male=False, musician=True, from_usa=True, over_30=True),
+    _char("The Weeknd", real=True, male=True, musician=True, from_usa=True, over_30=True),
+    _char("Моргенштерн", real=True, male=True, musician=True, blogger=True, from_russia=True, over_30=False),
+    _char("Тимати", real=True, male=True, musician=True, from_russia=True, over_30=True),
+    _char("Ariana Grande", real=True, male=False, musician=True, from_usa=True, over_30=True),
+    # --- Актёры ---
+    _char("Леонардо ДиКаприо", real=True, male=True, actor=True, from_usa=True, over_30=True),
+    _char("Том Круз", real=True, male=True, actor=True, from_usa=True, over_30=True),
+    _char("Уилл Смит", real=True, male=True, actor=True, from_usa=True, over_30=True),
+    _char("Джонни Депп", real=True, male=True, actor=True, from_usa=True, over_30=True),
+    _char("Дуэйн Джонсон", real=True, male=True, actor=True, sport=True, from_usa=True, over_30=True),
+    _char("Скарлетт Йоханссон", real=True, male=False, actor=True, from_usa=True, over_30=True),
+    # --- Блогеры / стримеры ---
+    _char("MrBeast", real=True, male=True, blogger=True, from_usa=True, over_30=False),
+    _char("PewDiePie", real=True, male=True, blogger=True, over_30=True),
+    _char("Ивангай", real=True, male=True, blogger=True, from_russia=True, over_30=True),
+    _char("A4", real=True, male=True, blogger=True, from_russia=True, over_30=False),
+    # --- Политики ---
+    _char("Владимир Путин", real=True, male=True, politician=True, from_russia=True, over_30=True),
+    _char("Дональд Трамп", real=True, male=True, politician=True, from_usa=True, over_30=True),
+    _char("Барак Обама", real=True, male=True, politician=True, from_usa=True, over_30=True),
+    # --- Персонажи видеоигр ---
+    _char("Марио", real=False, male=True, videogame_character=True),
+    _char("Соник", real=False, male=True, videogame_character=True, animal=True),
+    _char("Кратос", real=False, male=True, videogame_character=True, over_30=True),
+    _char("Мастер Чиф", real=False, male=True, videogame_character=True, over_30=True),
+    _char("Лара Крофт", real=False, male=False, videogame_character=True, over_30=True),
+    _char("Геральт из Ривии", real=False, male=True, videogame_character=True, over_30=True),
+    _char("Стив (Minecraft)", real=False, male=True, videogame_character=True),
+    # --- Персонажи фильмов ---
+    _char("Джек Воробей", real=False, male=True, movie_character=True, over_30=True),
+    _char("Форрест Гамп", real=False, male=True, movie_character=True, over_30=True),
+    _char("Йода", real=False, male=True, movie_character=True, over_30=True),
+    _char("Нео (Матрица)", real=False, male=True, movie_character=True, over_30=True),
+    _char("Гарри Поттер", real=False, male=True, movie_character=True, over_30=False),
+    _char("Джокер", real=False, male=True, movie_character=True, superhero=True, over_30=True),
+    # --- Персонажи мультфильмов ---
+    _char("Губка Боб", real=False, male=True, cartoon_character=True, animal=False),
+    _char("Микки Маус", real=False, male=True, cartoon_character=True, animal=True),
+    _char("Гомер Симпсон", real=False, male=True, cartoon_character=True, over_30=True),
+    _char("Багз Банни", real=False, male=True, cartoon_character=True, animal=True),
+    _char("Скуби-Ду", real=False, male=True, cartoon_character=True, animal=True),
+    _char("Кот Том", real=False, male=True, cartoon_character=True, animal=True),
+    # --- Супергерои ---
+    _char("Бэтмен", real=False, male=True, superhero=True, movie_character=True, from_usa=True, over_30=True),
+    _char("Супермен", real=False, male=True, superhero=True, movie_character=True, from_usa=True, over_30=True),
+    _char("Человек-паук", real=False, male=True, superhero=True, movie_character=True, from_usa=True, over_30=False),
+    _char("Железный человек", real=False, male=True, superhero=True, movie_character=True, from_usa=True, over_30=True),
+    _char("Чудо-женщина", real=False, male=False, superhero=True, movie_character=True, from_usa=True, over_30=True),
+    _char("Дэдпул", real=False, male=True, superhero=True, movie_character=True, from_usa=True, over_30=True),
+    _char("Тор", real=False, male=True, superhero=True, movie_character=True, over_30=True),
+    _char("Халк", real=False, male=True, superhero=True, movie_character=True, from_usa=True, over_30=True),
+    # --- Животные (реальные) ---
+    _char("Хатико", real=True, male=True, animal=True),
+    _char("Грампи Кэт", real=True, male=False, animal=True, blogger=True, from_usa=True),
+    # --- Аниме-персонажи ---
+    _char("Наруто Узумаки", real=False, male=True, anime_character=True, over_30=False),
+    _char("Гоку", real=False, male=True, anime_character=True, over_30=True),
+    _char("Луффи", real=False, male=True, anime_character=True, over_30=False),
+    _char("Лайт Ягами", real=False, male=True, anime_character=True, over_30=False),
+    _char("Сайтама", real=False, male=True, anime_character=True, over_30=True),
+    _char("Леви Аккерман", real=False, male=True, anime_character=True, over_30=False),
+]
+
+
+GUESS_MODE_THRESHOLD = 5  # при таком и меньшем числе кандидатов — перебор по имени
+
+
+def _guess_split_score(candidates, feature):
+  """Возвращает (true_count, false_count) кандидатов по признаку —
+  используется, чтобы выбрать вопрос, максимально близкий к 50/50."""
+  true_count = sum(1 for c in candidates if c[feature])
+  false_count = len(candidates) - true_count
+  return true_count, false_count
+
+
+def _choose_next_feature(candidates, asked_features):
+  """Возвращает ключ следующего признака-вопроса или None, если больше нет
+  признаков, которые реально разделяют оставшихся кандидатов (в этом случае
+  вызывающий код должен перейти к прямому перебору имён)."""
+  available = [f for f in GUESS_FEATURE_KEYS if f not in asked_features]
+  if not available:
+    return None
+
+  scored = []
+  for feature in available:
+    true_count, false_count = _guess_split_score(candidates, feature)
+    if true_count == 0 or false_count == 0:
+      continue  # признак ничего не разделяет среди оставшихся
+    balance = abs(true_count - false_count)
+    priority = (
+        GUESS_PRIORITY_ORDER.index(feature)
+        if feature in GUESS_PRIORITY_ORDER
+        else len(GUESS_PRIORITY_ORDER)
+    )
+    scored.append((balance, priority, feature))
+
+  if not scored:
+    return None  # ни один признак больше не делит кандидатов
+
+  scored.sort(key=lambda x: (x[0], x[1]))
+  return scored[0][2]
+
+
+def _filter_candidates(candidates, feature, answer):
+  if answer is None:  # "Не знаю" — не фильтруем
+    return candidates
+  return [c for c in candidates if c[feature] == answer]
+
+
+
 def check_subscription(user_id):
   try:
     member = bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
@@ -722,13 +959,10 @@ def send_welcome(message):
 def send_main_menu(chat_id, user_name):
   markup = types.InlineKeyboardMarkup(row_width=2)
   markup.add(
-      types.InlineKeyboardButton(
-          "🎮 Игра «Правда или Ложь»", callback_data="start_chat_game"
-      ),
+      types.InlineKeyboardButton("🎮 Игры", callback_data="games_menu"),
   )
   markup.add(
       types.InlineKeyboardButton("🐐 GOAT Chat", callback_data="goat_chat"),
-      types.InlineKeyboardButton("🔍 GOAT Анализ", callback_data="goat_analysis"),
       types.InlineKeyboardButton("🎨 Генерация", callback_data="ask_draw"),
       types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
       types.InlineKeyboardButton("🏆 Лидеры", callback_data="show_leaderboard"),
@@ -736,11 +970,30 @@ def send_main_menu(chat_id, user_name):
   )
 
   welcome_text = (
-      f"🐐 <b>GOAT AI</b>\nДобро пожаловать, {user_name}!\n\n🎮 Не забудьте"
-      " попробовать игру «Правда или Ложь» — испытайте себя и заработайте"
-      " очки!\n\nВыберите раздел:"
+      f"🐐 <b>GOAT AI</b>\nДобро пожаловать, {user_name}!\n\n🎮 Загляните в"
+      " «Игры» — там «Правда или Ложь» и новая «GOAT Угадай»!\n\nВыберите"
+      " раздел:"
   )
   bot.send_message(chat_id, welcome_text, reply_markup=markup, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "games_menu")
+def cb_games_menu(call):
+  bot.answer_callback_query(call.id)
+  markup = types.InlineKeyboardMarkup(row_width=1)
+  markup.add(
+      types.InlineKeyboardButton(
+          "🧠 Правда или Ложь", callback_data="start_chat_game"
+      ),
+      types.InlineKeyboardButton("🔮 GOAT Угадай", callback_data="start_guess_game"),
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
+  )
+  bot.send_message(
+      call.message.chat.id,
+      "🎮 <b>Игры</b>\nВыберите игру:",
+      reply_markup=markup,
+      parse_mode="HTML",
+  )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
@@ -763,6 +1016,7 @@ def process_check_sub(call):
 def cb_back_to_menu(call):
   bot.answer_callback_query(call.id)
   user_states.pop(call.from_user.id, None)
+  guess_sessions.pop(call.from_user.id, None)
   send_main_menu(call.message.chat.id, call.from_user.first_name or "друг")
 
 
@@ -773,9 +1027,9 @@ def send_help(message):
       " Перезапустить бота\n🔹 <code>/game</code> — Игра «Правда или"
       " Ложь»\n🔹 <code>/top</code> — Таблица лидеров\n🔹"
       " <code>/admin</code> — Панель администратора (только для"
-      " админа)\n\n🔍 <b>GOAT Анализ:</b> выберите категорию в меню и"
-      " пришлите фото или текст.\n🐐 <b>GOAT Chat:</b> выберите личность"
-      " ИИ и просто пишите сообщения."
+      " админа)\n\n🎮 <b>Игры:</b> «Правда или Ложь» и «GOAT Угадай» —"
+      " раздел «🎮 Игры» в главном меню.\n🐐 <b>GOAT Chat:</b> выберите"
+      " личность ИИ и просто пишите сообщения."
   )
   bot.send_message(message.chat.id, help_text, parse_mode="HTML")
 
@@ -868,77 +1122,6 @@ def cb_set_mode(call):
     )
 
 
-# ================================================================
-# 10. GOAT АНАЛИЗ — единый режим, без кнопок-категорий
-# ================================================================
-@bot.callback_query_handler(func=lambda call: call.data == "goat_analysis")
-def cb_goat_analysis(call):
-  bot.answer_callback_query(call.id)
-  markup = types.InlineKeyboardMarkup()
-  markup.add(
-      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
-  )
-  text = (
-      "🔍 <b>GOAT Анализ</b>\nПросто опишите словами, что нужно разобрать —"
-      " бизнес-идею, текст, код, план, что угодно. Например: «оцени идею"
-      " для бизнеса — доставка обедов в офисы» или «разбери этот текст:"
-      " ...».\n\n<i>Всегда честно — без лести и без грубости, только"
-      " аргументы и советы.</i>"
-  )
-  msg = bot.send_message(
-      call.message.chat.id, text, reply_markup=markup, parse_mode="HTML"
-  )
-  bot.register_next_step_handler(msg, process_analysis)
-
-
-def process_analysis(message):
-  user_id = message.from_user.id
-  if not require_subscription(message.chat.id, user_id):
-    return
-
-  content = (message.text or "").strip()
-  if not content or content.startswith("/"):
-    bot.send_message(message.chat.id, "❌ Анализ отменен.")
-    return
-
-  bot.send_chat_action(message.chat.id, "typing")
-
-  if not groq_api_key:
-    bot.send_message(message.chat.id, "❌ Ключ Groq API не настроен в Secrets.")
-    return
-
-  try:
-    completion = groq_client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": ANALYST_SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
-        model=GROQ_MODEL,
-    )
-    answer = completion.choices[0].message.content.strip()
-    answer = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", answer)
-
-    leveled_up, new_level, coins, xp = add_xp(
-        user_id, message.from_user.first_name or "друг", 20
-    )
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton(
-            "🏠 Главное меню", callback_data="back_to_menu"
-        )
-    )
-    text = f"🔍 <b>Анализ</b>\n\n{answer}\n\n<i>+20 XP</i>"
-    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
-
-    if leveled_up:
-      send_level_up_message(message.chat.id, new_level, coins)
-  except Exception as e:
-    print(f"Ошибка Groq API (анализ): {e}")
-    bot.send_message(message.chat.id, "❌ Не удалось выполнить анализ.")
-    notify_admin_error("GOAT анализ", e)
-
-
 def send_level_up_message(chat_id, new_level, coins):
   bot.send_message(
       chat_id,
@@ -959,9 +1142,22 @@ def cb_profile(call):
 
   row, place = get_profile_row(user_id)
   if row:
-    score, streak, games, wins, messages_count, xp, level, coins = row
+    (
+        score,
+        streak,
+        games,
+        wins,
+        messages_count,
+        xp,
+        level,
+        coins,
+        guess_games,
+        guess_wins,
+        best_guess_questions,
+    ) = row
   else:
     score = streak = games = wins = messages_count = xp = coins = 0
+    guess_games = guess_wins = best_guess_questions = 0
     level = 1
 
   needed = xp_needed_for_level(level)
@@ -987,6 +1183,10 @@ def cb_profile(call):
       f"💬 Сообщений: {messages_count}\n"
       f"🥇 Место в рейтинге: #{place}\n"
       f"🎭 Активный режим: {active_mode_name}\n"
+      "━━━━━━━━━━━━━━━━\n"
+      f"🔮 Игр «GOAT Угадай»: {guess_games}\n"
+      f"🎯 Угадано: {guess_wins}\n"
+      f"🧠 Лучший результат: {best_guess_questions or '—'}\n"
       "━━━━━━━━━━━━━━━━"
   )
   markup = types.InlineKeyboardMarkup()
@@ -1232,6 +1432,290 @@ def cb_game_answer(call):
     send_level_up_message(call.message.chat.id, new_level, coins)
 
 
+# ================================================================
+# 9б. ИГРА "GOAT УГАДАЙ" — интерфейс и игровой цикл
+# ================================================================
+GUESS_MAX_TURNS = 20
+
+
+def _guess_edit_or_send(chat_id, user_id, text, markup):
+  """Редактирует текущее игровое сообщение, если возможно, иначе отправляет
+  новое (и запоминает его id) — чтобы не спамить сообщениями."""
+  session = guess_sessions.get(user_id)
+  message_id = session.get("message_id") if session else None
+  if message_id:
+    try:
+      bot.edit_message_text(
+          text,
+          chat_id=chat_id,
+          message_id=message_id,
+          reply_markup=markup,
+          parse_mode="HTML",
+      )
+      return
+    except Exception:
+      pass  # сообщение могло устареть/удалиться — отправим новое
+  msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+  if session is not None:
+    session["message_id"] = msg.message_id
+
+
+def _guess_question_markup():
+  markup = types.InlineKeyboardMarkup(row_width=3)
+  markup.add(
+      types.InlineKeyboardButton("✅ Да", callback_data="guess_yes"),
+      types.InlineKeyboardButton("❌ Нет", callback_data="guess_no"),
+      types.InlineKeyboardButton("🤷 Не знаю", callback_data="guess_dunno"),
+  )
+  markup.add(
+      types.InlineKeyboardButton("🏠 Завершить игру", callback_data="guess_end")
+  )
+  return markup
+
+
+def _guess_confirm_markup():
+  markup = types.InlineKeyboardMarkup(row_width=2)
+  markup.add(
+      types.InlineKeyboardButton("✅ Да, угадал", callback_data="guess_correct"),
+      types.InlineKeyboardButton("❌ Нет", callback_data="guess_incorrect"),
+  )
+  markup.add(
+      types.InlineKeyboardButton("🏠 Завершить игру", callback_data="guess_end")
+  )
+  return markup
+
+
+def _guess_advance(chat_id, user_id):
+  """Определяет следующий шаг игры: вопрос, предположение по имени или
+  завершение — и показывает его пользователю."""
+  session = guess_sessions.get(user_id)
+  if not session:
+    return
+  candidates = session["candidates"]
+
+  if not candidates:
+    _guess_ask_for_name(chat_id, user_id)
+    return
+
+  if session["turn"] >= GUESS_MAX_TURNS:
+    _guess_give_up(chat_id, user_id)
+    return
+
+  if len(candidates) <= GUESS_MODE_THRESHOLD:
+    session["mode"] = "guess_confirm"
+    session["current_guess_name"] = candidates[0]["name"]
+    session["turn"] += 1
+    text = (
+        "Кажется, я близок... 👀\n\nТы загадал <b>"
+        f"{candidates[0]['name']}</b>?"
+    )
+    _guess_edit_or_send(chat_id, user_id, text, _guess_confirm_markup())
+    return
+
+  feature = _choose_next_feature(candidates, session["asked_features"])
+  if feature is None:
+    session["mode"] = "guess_confirm"
+    session["current_guess_name"] = candidates[0]["name"]
+    session["turn"] += 1
+    text = (
+        "Кажется, я близок... 👀\n\nТы загадал <b>"
+        f"{candidates[0]['name']}</b>?"
+    )
+    _guess_edit_or_send(chat_id, user_id, text, _guess_confirm_markup())
+    return
+
+  session["mode"] = "question"
+  session["current_feature"] = feature
+  session["turn"] += 1
+  text = (
+      f"🔮 <b>Вопрос {session['turn']}/{GUESS_MAX_TURNS}</b>\n\n"
+      f"{GUESS_FEATURE_QUESTIONS[feature]}"
+  )
+  _guess_edit_or_send(chat_id, user_id, text, _guess_question_markup())
+
+
+def _guess_ask_for_name(chat_id, user_id):
+  guess_sessions.pop(user_id, None)
+  msg = bot.send_message(
+      chat_id,
+      "🤔 <b>Ты загадал кого-то, кого я пока не знаю.</b>\n\nКто это был?"
+      " Напиши имя одним сообщением.",
+      parse_mode="HTML",
+  )
+  bot.register_next_step_handler(msg, _guess_receive_unknown_name, user_id)
+
+
+def _guess_receive_unknown_name(message, user_id):
+  chat_id = message.chat.id
+  name = (message.text or "").strip()
+  update_guess_stats(user_id, won=False, questions_used=0)
+
+  if name and not name.startswith("/"):
+    notify_admin_error(
+        "новый персонаж для 'GOAT Угадай'",
+        f"Пользователь {message.from_user.first_name} загадал: {name}",
+    )
+    reply_text = (
+        f"Спасибо! Запомнил — <b>{name}</b>. Добавим этот вариант в базу в"
+        " будущем 🙌"
+    )
+  else:
+    reply_text = "Ладно, в другой раз угадаю! 😄"
+
+  markup = types.InlineKeyboardMarkup(row_width=2)
+  markup.add(
+      types.InlineKeyboardButton(
+          "🔄 Сыграть ещё", callback_data="start_guess_game"
+      ),
+      types.InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu"),
+  )
+  bot.send_message(chat_id, reply_text, reply_markup=markup, parse_mode="HTML")
+
+
+def _guess_give_up(chat_id, user_id):
+  update_guess_stats(user_id, won=False, questions_used=0)
+  markup = types.InlineKeyboardMarkup(row_width=2)
+  markup.add(
+      types.InlineKeyboardButton(
+          "🔄 Сыграть ещё", callback_data="start_guess_game"
+      ),
+      types.InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu"),
+  )
+  text = (
+      "😵 <b>Ты меня переиграл.</b>\n\nЯ не смог угадать персонажа за"
+      f" {GUESS_MAX_TURNS} вопросов. Кого ты загадал?"
+  )
+  _guess_edit_or_send(chat_id, user_id, text, markup)
+  guess_sessions.pop(user_id, None)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "start_guess_game")
+def cb_start_guess_game(call):
+  bot.answer_callback_query(call.id)
+  chat_id = call.message.chat.id
+  user_id = call.from_user.id
+  if not require_subscription(chat_id, user_id):
+    return
+
+  ensure_user(user_id, call.from_user.first_name or "друг")
+  markup = types.InlineKeyboardMarkup(row_width=1)
+  markup.add(
+      types.InlineKeyboardButton("▶️ Начать", callback_data="guess_begin"),
+      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
+  )
+  bot.send_message(
+      chat_id,
+      "🔮 <b>GOAT Угадай</b>\n\nЗагадай любого человека, персонажа,"
+      " животное или известную личность.\nНе говори мне ответ.\n\nКогда"
+      " будешь готов, нажми:",
+      reply_markup=markup,
+      parse_mode="HTML",
+  )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "guess_begin")
+def cb_guess_begin(call):
+  bot.answer_callback_query(call.id)
+  chat_id = call.message.chat.id
+  user_id = call.from_user.id
+
+  guess_sessions[user_id] = {
+      "candidates": CHARACTERS[:],
+      "asked_features": set(),
+      "turn": 0,
+      "mode": None,
+      "current_feature": None,
+      "current_guess_name": None,
+      "message_id": call.message.message_id,
+  }
+  _guess_advance(chat_id, user_id)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in ["guess_yes", "guess_no", "guess_dunno"]
+)
+def cb_guess_answer(call):
+  bot.answer_callback_query(call.id)
+  chat_id = call.message.chat.id
+  user_id = call.from_user.id
+  session = guess_sessions.get(user_id)
+  if not session or session.get("mode") != "question":
+    return
+
+  answer_map = {"guess_yes": True, "guess_no": False, "guess_dunno": None}
+  answer = answer_map[call.data]
+  feature = session["current_feature"]
+  session["asked_features"].add(feature)
+  session["candidates"] = _filter_candidates(session["candidates"], feature, answer)
+  _guess_advance(chat_id, user_id)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in ["guess_correct", "guess_incorrect"]
+)
+def cb_guess_result(call):
+  bot.answer_callback_query(call.id)
+  chat_id = call.message.chat.id
+  user_id = call.from_user.id
+  session = guess_sessions.get(user_id)
+  if not session or session.get("mode") != "guess_confirm":
+    return
+
+  if call.data == "guess_correct":
+    name = session["current_guess_name"]
+    turns_used = session["turn"]
+
+    update_guess_stats(user_id, won=True, questions_used=turns_used)
+    add_coins(user_id, 25)
+    leveled_up, new_level, coins, xp = add_xp(
+        user_id, call.from_user.first_name or "друг", 50
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            "🔄 Сыграть ещё", callback_data="start_guess_game"
+        ),
+        types.InlineKeyboardButton("🏠 Меню", callback_data="back_to_menu"),
+    )
+    text = (
+        f"🎯 <b>Я УГАДАЛ!</b>\n\nЭто был:\n🏆 <b>{name}</b>\n\nВопросов:"
+        f" {turns_used}\n\n+50 XP\n+25 🪙"
+    )
+    _guess_edit_or_send(chat_id, user_id, text, markup)
+    guess_sessions.pop(user_id, None)
+    if leveled_up:
+      send_level_up_message(chat_id, new_level, coins)
+    return
+
+  # Не угадал — убираем этого кандидата и продолжаем
+  rejected_name = session["current_guess_name"]
+  session["candidates"] = [
+      c for c in session["candidates"] if c["name"] != rejected_name
+  ]
+  _guess_advance(chat_id, user_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "guess_end")
+def cb_guess_end(call):
+  bot.answer_callback_query(call.id)
+  user_id = call.from_user.id
+  guess_sessions.pop(user_id, None)
+  markup = types.InlineKeyboardMarkup()
+  markup.add(
+      types.InlineKeyboardButton("🏠 Главное меню", callback_data="back_to_menu")
+  )
+  try:
+    bot.edit_message_text(
+        "🚪 Игра остановлена.",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+    )
+  except Exception:
+    bot.send_message(call.message.chat.id, "🚪 Игра остановлена.", reply_markup=markup)
+
+
 def send_leaderboard(chat_id, user_id, edit_message_id=None):
   conn = sqlite3.connect(DB_PATH, check_same_thread=False)
   cursor = conn.cursor()
@@ -1328,7 +1812,6 @@ def cb_ask_draw(call):
   markup = types.InlineKeyboardMarkup(row_width=1)
   markup.add(
       types.InlineKeyboardButton("✨ Сгенерировать с нуля", callback_data="gen_new"),
-      types.InlineKeyboardButton("😂 Мем с надписью", callback_data="gen_meme"),
       types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu"),
   )
   bot.send_message(
@@ -1405,136 +1888,6 @@ def process_image_prompt(message):
   except Exception as e:
     print(f"Ошибка генерации изображения: {e}")
     bot.send_message(message.chat.id, "❌ Не удалось сгенерировать изображение.")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "gen_meme")
-def cb_gen_meme(call):
-  bot.answer_callback_query(call.id)
-  user_id = call.from_user.id
-  if not require_subscription(call.message.chat.id, user_id):
-    return
-  markup = types.InlineKeyboardMarkup()
-  markup.add(
-      types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
-  )
-  msg = bot.send_message(
-      call.message.chat.id,
-      "😂 <b>Мем с надписью</b>\n\nОпишите идею одним сообщением — какая"
-      " картинка и что должно быть написано. Например: «кот в костюме"
-      " директора, надпись сверху: ПОНЕДЕЛЬНИК, снизу: СНОВА НА РАБОТУ».",
-      reply_markup=markup,
-      parse_mode="HTML",
-  )
-  bot.register_next_step_handler(msg, process_meme_prompt)
-
-
-def _load_meme_font(size):
-  try:
-    return ImageFont.load_default(size=size)
-  except TypeError:
-    # Старые версии Pillow не поддерживают size у load_default()
-    return ImageFont.load_default()
-
-
-def _draw_meme_caption(draw, text, img_width, y, font_size):
-  if not text:
-    return
-  font = _load_meme_font(font_size)
-  text = text.upper()
-  bbox = draw.textbbox((0, 0), text, font=font, stroke_width=3)
-  text_w = bbox[2] - bbox[0]
-  x = max((img_width - text_w) // 2, 10)
-  draw.text(
-      (x, y), text, font=font, fill="white", stroke_width=3, stroke_fill="black"
-  )
-
-
-def process_meme_prompt(message):
-  user_id = message.from_user.id
-  chat_id = message.chat.id
-  if not require_subscription(chat_id, user_id):
-    return
-
-  idea = (message.text or "").strip()
-  if not idea or idea.startswith("/"):
-    bot.send_message(chat_id, "❌ Создание мема отменено.")
-    return
-
-  status_msg = bot.send_message(
-      chat_id, "😂 <b>Придумываю мем...</b>", parse_mode="HTML"
-  )
-  bot.send_chat_action(chat_id, "upload_photo")
-
-  try:
-    meme_plan_raw = groq_client.chat.completions.create(
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты помощник для генерации мемов. По идее пользователя"
-                    " верни СТРОГО один JSON-объект, без markdown и"
-                    " пояснений: {\"scene\": короткое описание картинки на"
-                    " английском для генератора изображений, \"top_text\":"
-                    " короткая надпись сверху на русском капсом (до 40"
-                    " символов, можно пустую строку), \"bottom_text\":"
-                    " короткая надпись снизу на русском капсом (до 40"
-                    " символов, можно пустую строку)}."
-                ),
-            },
-            {"role": "user", "content": idea},
-        ],
-        model=GROQ_MODEL,
-    ).choices[0].message.content.strip()
-
-    meme_plan_raw = re.sub(r"^```json|```$", "", meme_plan_raw.strip()).strip()
-    meme_plan = json.loads(meme_plan_raw)
-    scene = meme_plan.get("scene") or idea
-    top_text = (meme_plan.get("top_text") or "").strip()
-    bottom_text = (meme_plan.get("bottom_text") or "").strip()
-
-    seed = random.randint(1, 1000000)
-    encoded_scene = urllib.parse.quote(scene)
-    image_url = (
-        f"https://image.pollinations.ai/prompt/{encoded_scene}"
-        f"?model=flux&width=1024&height=1024&nologo=true&seed={seed}"
-    )
-    image_bytes = fetch_pollinations_image(image_url)
-    if not image_bytes:
-      bot.send_message(
-          chat_id,
-          "❌ Сервис генерации сейчас не отвечает. Попробуйте ещё раз через"
-          " минуту.",
-      )
-      bot.delete_message(chat_id, status_msg.message_id)
-      return
-
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    font_size = max(img.width // 12, 32)
-    _draw_meme_caption(draw, top_text, img.width, 15, font_size)
-    if bottom_text:
-      bbox = draw.textbbox((0, 0), bottom_text.upper(), stroke_width=3)
-      text_h = bbox[3] - bbox[1]
-      _draw_meme_caption(
-          draw, bottom_text, img.width, img.height - text_h - 25, font_size
-      )
-
-    output = io.BytesIO()
-    img.save(output, format="JPEG", quality=92)
-    output.seek(0)
-
-    bot.send_photo(chat_id, output, caption="😂 <b>Ваш мем</b>", parse_mode="HTML")
-    bot.delete_message(chat_id, status_msg.message_id)
-
-    leveled_up, new_level, coins, xp = add_xp(
-        user_id, message.from_user.first_name or "друг", 15
-    )
-    if leveled_up:
-      send_level_up_message(chat_id, new_level, coins)
-  except Exception as e:
-    print(f"Ошибка создания мема: {e}")
-    bot.send_message(chat_id, "❌ Не удалось создать мем. Попробуйте ещё раз.")
-    notify_admin_error("генерация мема", e)
 
 
 # ================================================================
